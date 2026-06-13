@@ -13,7 +13,7 @@ class Flow < Formula
   desc "Mouse-first terminal focus app: Pomodoro, todos, habits, ambient audio, app blocker"
   homepage "https://github.com/thepathless/flow"
   url "https://github.com/thepathless/flow/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "REPLACE_WITH_TARBALL_SHA256"
+  sha256 "17e071c2820f164ddff36a84022941b2705fa37fd9b787f753967eb02b98f69d"
   license "MIT"
 
   depends_on "python@3.12"

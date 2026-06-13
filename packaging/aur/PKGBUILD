@@ -20,7 +20,7 @@ optdepends=('mpv: ambient / lofi audio playback'
             'zenity: native folder picker for stats export'
             'fzf: terminal fuzzy folder picker for stats export')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/thepathless/flow/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')  # replace with `updpkgsums` once the v$pkgver tag is pushed
+sha256sums=('17e071c2820f164ddff36a84022941b2705fa37fd9b787f753967eb02b98f69d')
 
 package() {
   cd "$srcdir/flow-$pkgver"
