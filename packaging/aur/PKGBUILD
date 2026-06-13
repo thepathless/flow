@@ -1,0 +1,30 @@
+# Maintainer: Suvadeep Mondal <suvadeep.apc at gmail dot com>
+#
+# AUR package for `flow` — a single-file, zero-dependency terminal focus app.
+# This builds the versioned release tarball from GitHub. To publish/update:
+#   1. Bump pkgver to match a pushed `vX.Y.Z` git tag.
+#   2. Run `updpkgsums` to fill in sha256sums from the real tarball.
+#   3. Run `makepkg --printsrcinfo > .SRCINFO`, then commit + push to the AUR.
+
+pkgname=flowtui
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Mouse-first terminal focus app: Pomodoro timer, nested todos, habit tracker, ambient audio and an app blocker"
+arch=('any')
+url="https://github.com/thepathless/flow"
+license=('MIT')
+depends=('python')
+optdepends=('mpv: ambient / lofi audio playback'
+            'libpulse: transition chimes (paplay)'
+            'cava: real audio-reactive spectrum visualizer'
+            'zenity: native folder picker for stats export'
+            'fzf: terminal fuzzy folder picker for stats export')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/thepathless/flow/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # replace with `updpkgsums` once the v$pkgver tag is pushed
+
+package() {
+  cd "$srcdir/flow-$pkgver"
+  install -Dm755 flow "$pkgdir/usr/bin/flow"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -15,5 +15,8 @@ dist/
 .vscode/
 .claude/
 
+# AI-assistant scratch — kept out of the public repo
+/CLAUDE.md
+
 # Stray local dumps (e.g. directory listings captured during development)
 *-ls.txt

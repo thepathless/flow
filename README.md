@@ -13,12 +13,12 @@ all on one screen, in one file, with zero Python dependencies.
 ![Dependencies: 0](https://img.shields.io/badge/dependencies-0-22c55e?style=flat-square)
 ![Source: single file](https://img.shields.io/badge/source-single%20file-8b5cf6?style=flat-square)
 
-<a href="assets/flow-demo.mp4">
-  <img src="assets/flow-demo.gif" alt="flow demo — Pomodoro timer, todos, habits and ambient audio in one terminal screen" width="820">
-</a>
+</div>
 
-<sub>▶ <a href="assets/flow-demo.mp4"><b>Click the demo for the full-quality video</b></a></sub>
+https://github.com/user-attachments/assets/ed1a6ea4-03de-444f-9d69-c06aade97988
 
+<div align="center">
+<sub>▶ Full demo, with sound. If the player doesn't load, <a href="https://github.com/thepathless/flow/releases/tag/demo">watch it on the Releases page</a> · <a href="assets/flow-poster.png">screenshot</a></sub>
 </div>
 
 ---
@@ -57,33 +57,35 @@ JSON files under `~/.config/flow/`.
 > flow runs on **Linux and macOS**. It needs nothing beyond Python 3.8+ —
 > optional system tools (below) unlock audio, the visualizer and native dialogs.
 
-### From source — the quickest start
+### Arch Linux (AUR)
+
+```sh
+yay -S flowtui          # or: paru -S flowtui
+```
+
+### macOS (Homebrew)
+
+```sh
+brew install thepathless/flow/flow
+```
+
+### pip
+
+```sh
+pip install flowtui
+flow
+```
+
+<sub>Want the absolute latest, straight from `main`? `pip install git+https://github.com/thepathless/flow.git`</sub>
+
+### From source
 
 ```sh
 git clone https://github.com/thepathless/flow.git
 cd flow
 ./flow                 # run directly — no install step needed
+./install.sh           # or copy the script to ~/.local/bin
 ```
-
-Then, optionally, put it on your `PATH`:
-
-```sh
-./install.sh           # copies the script to ~/.local/bin
-```
-
-### With pip
-
-Install straight from the repository (this fetches *this* project — see the note below):
-
-```sh
-pip install git+https://github.com/thepathless/flow.git
-flow
-```
-
-> [!IMPORTANT]
-> The name `flow-tui` on PyPI currently belongs to an unrelated package, so
-> `pip install flow-tui` will **not** install this app. Use the `git+` URL above
-> until a PyPI release is published under an available name.
 
 > **Windows:** not supported yet — ambient audio and the app blocker rely on
 > Linux/macOS facilities. Use [WSL](https://learn.microsoft.com/windows/wsl/install) in the meantime.
@@ -128,7 +130,8 @@ flow                 the application — a single script, the source of truth
 install.sh           installs the flow script to ~/.local/bin from a checkout
 pyproject.toml       pip / packaging metadata
 setup.py             installs the `flow` script via pip
-assets/              demo video, GIF and poster used in this README
+packaging/           AUR PKGBUILD + Homebrew formula for maintainers
+assets/              poster image used in this README
 tools/               byte-compile + render smoke tests
 .github/workflows/   CI (byte-compile + package build check)
 ```
@@ -148,5 +151,3 @@ same on every push. Issues and pull requests are welcome.
 ## License
 
 [MIT](LICENSE). Bundled ambient recordings are CC0 / public-domain.
-</content>
-</invoke>
