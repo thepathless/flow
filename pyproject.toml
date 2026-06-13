@@ -9,7 +9,7 @@
 # Build distributables:      python -m build      (produces wheel + sdist)
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -18,17 +18,15 @@ version = "1.0.0"
 description = "A mouse-first terminal focus app: Pomodoro timer, nested todos, habit tracker, ambient audio and an app blocker — one file, zero dependencies."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Suvadeep Mondal", email = "suvadeep.apc@gmail.com" }]
 keywords = ["pomodoro", "tui", "curses", "focus", "productivity", "habit-tracker", "terminal"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console :: Curses",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS :: MacOS X",
-    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Topic :: Office/Business :: Scheduling",
     "Topic :: Utilities",
@@ -42,7 +40,9 @@ Homepage = "https://github.com/thepathless/flow"
 Repository = "https://github.com/thepathless/flow"
 Issues = "https://github.com/thepathless/flow/issues"
 
-# Windows note: the bundled `windows-curses` is needed for curses there. It is
-# declared as an OS-conditional extra so Linux/macOS installs stay dependency-free.
-[project.optional-dependencies]
-windows = ["windows-curses; sys_platform == 'win32'"]
+# `flow` is a standalone script (installed via setup.py `scripts=`), not an
+# importable package. Disable setuptools' flat-layout auto-discovery so stray
+# top-level dirs (e.g. tools/) are never mistaken for packages to build.
+[tool.setuptools]
+packages = []
+py-modules = []

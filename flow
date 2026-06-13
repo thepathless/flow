@@ -2464,19 +2464,29 @@ class FlowTUI:
         self.buttons.clear()
         saddstr(self.stdscr, 0, 1, " ◉ flow ", curses.A_BOLD | curses.color_pair(5))
         
-        # Tabs navigation
+        # Tabs navigation. Each tab carries its keyboard shortcut as a leading
+        # highlighted letter (e.g. "[h ⌂ home]") so the binding is discoverable
+        # right where you'd click — no need to open the help screen. The key
+        # char is pure ASCII and sits before the (possibly wide) icon, so its
+        # column is exact regardless of emoji width.
         tx = 10
         tabs = [
-            ("home", " ⌂ home ", self.HOME),
-            ("focus", " ⏰ focus ", self.TIMER),
-            ("sounds", " 🎵 sounds ", self.SOUNDS),
-            ("stats", " 📊 stats ", self.STATS),
-            ("settings", " ⚙ settings ", self.SETTINGS),
+            ("home", "h", " ⌂ home ", self.HOME),
+            ("focus", "f", " ⏰ focus ", self.TIMER),
+            ("sounds", "o", " 🎵 sounds ", self.SOUNDS),
+            ("stats", "t", " 📊 stats ", self.STATS),
+            ("settings", "s", " ⚙ settings ", self.SETTINGS),
         ]
-        for name, label, view_id in tabs:
-            style = curses.color_pair(1) | curses.A_REVERSE if self.view == view_id else curses.A_NORMAL
-            btn_text = f"[{label}]"
+        for name, key, label, view_id in tabs:
+            active = self.view == view_id
+            style = curses.color_pair(1) | curses.A_REVERSE if active else curses.A_NORMAL
+            btn_text = f"[{key}{label}]"
             saddstr(self.stdscr, 0, tx, btn_text, style)
+            # Make the leading shortcut letter pop. It lives at tx+1 (right after
+            # the '['), before any wide glyph, so the column is always correct.
+            key_style = (style | curses.A_BOLD | curses.A_UNDERLINE if active
+                         else curses.color_pair(5) | curses.A_BOLD | curses.A_UNDERLINE)
+            saddstr(self.stdscr, 0, tx + 1, key, key_style)
             self.register_btn(f"tab_{name}", 0, tx, btn_text, lambda vid=view_id: self.switch_view(vid))
             tx += len(btn_text) + 1
 
@@ -2696,7 +2706,7 @@ class FlowTUI:
         else:
             if self.view == self.HOME:
                 sw = "spc:start" if not self.stopwatch_on else "spc:stop"
-                p += [sw, "r:reset", "h/o/t/f/s:views", "m:mute", "v:viz", "[ ]:width"]
+                p += [sw, "r:reset", "m:mute", "v:viz", "[ ]:width"]
             elif self.view == self.TIMER:
                 pk = "spc:resume" if self.timer_paused else "spc:pause"
                 p += [pk, "r:reset", "m:mute", "+/-:vol", "v:viz", "Esc:back"]

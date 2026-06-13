@@ -4,49 +4,37 @@ A mouse-first **terminal focus app** — Pomodoro timer, nested to-dos, daily ha
 tracker, ambient/lofi audio mixer, and an app blocker, all in one screen.
 
 - **One file, zero Python dependencies.** Pure standard library + `curses`.
-- Runs on **Linux, macOS, and Windows**.
+- Runs on **Linux and macOS**.
 - All state lives under `~/.config/flow/` (`config.json`, `tasks.json`, `habits.json`).
 
 ---
 
 ## Install
 
-### Linux
+Two supported ways — both work on **Linux and macOS**.
 
-| Method | Command | Notes |
-| --- | --- | --- |
-| **AppImage** (recommended) | Download `flow-x86_64.AppImage` from [Releases], `chmod +x`, run it | Bundles Python — works on any glibc distro, nothing to install |
-| **Arch / Manjaro (AUR)** | `yay -S flow-tui` | Or `paru -S flow-tui`; builds the PKGBUILD |
-| **Any distro (Make)** | `sudo make -C linux install` | Copies `flow` to `/usr/local/bin` + a desktop entry |
-| **Debian/Ubuntu/Fedora** | install the `.deb`/`.rpm` from [Releases] | Built with `nfpm` (see `linux/`) |
-| **pip** | `pip install flow-tui` | Cross-platform fallback |
-
-### macOS
+### pip
 
 ```sh
-brew install thepathless/flow/flow-tui     # once published; see macos/README.md
-# or, simplest, with no extra setup:
-pip3 install flow-tui
+pip install flow-tui
+flow
 ```
 
-### Windows
-
-```powershell
-pip install "flow-tui[windows]"
-```
-
-`flow` is a console app — run it from **Windows Terminal** for best results. See
-[`windows/README.md`](windows/README.md).
-
-### From source (any OS)
+### From source
 
 ```sh
 git clone https://github.com/thepathless/flow.git
 cd flow
-./flow                 # run directly
-./install.sh           # or install to ~/.local/bin (Linux/macOS)
-pip install .          # or install via pip
+./flow                 # run directly — no install needed
+./install.sh           # or install to ~/.local/bin
+pip install .          # or install via pip from the checkout
 ```
+
+> **Windows:** not supported yet — several features (ambient audio, the app
+> blocker) rely on Linux/macOS facilities. Use [WSL] in the meantime; native
+> Windows support may come later.
+
+[WSL]: https://learn.microsoft.com/windows/wsl/install
 
 ---
 
@@ -67,7 +55,10 @@ detects them at runtime and degrades gracefully):
 
 ## Keyboard cheatsheet
 
-`Tab` switch panel · `h`/`o`/`t` home/sounds/stats · `f`/`s` focus/settings ·
+Every view's shortcut is shown as the highlighted letter on its tab, so you can
+learn navigation at a glance — but here's the full set:
+
+`Tab` switch panel · `h` home · `f` focus · `o` sounds · `t` stats · `s` settings ·
 `space` start/pause · `m` mute · `+`/`-` volume · `v` visualizer · `?` help · `q` quit
 
 ---
@@ -76,14 +67,11 @@ detects them at runtime and degrades gracefully):
 
 ```
 flow                 the application (single script — the source of truth)
-install.sh           simple installer for Linux/macOS from a checkout
+install.sh           installs the flow script to ~/.local/bin from a checkout
 pyproject.toml       pip / PyPI metadata
 setup.py             installs the `flow` script via pip
-linux/               AppImage, AUR PKGBUILD, Makefile, .deb/.rpm, desktop entry
-macos/               Homebrew formula + instructions
-windows/             pip-based install notes
-github/              first-time "how to upload to GitHub" guide
-.github/workflows/   CI (syntax check) + release (builds the AppImage on a tag)
+tools/               byte-compile + render smoke tests
+.github/workflows/   CI (syntax check)
 ```
 
 ## License

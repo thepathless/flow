@@ -7,14 +7,8 @@ include install.sh
 
 # Bundled Krishna-flute recording (optional ambient track). It is NOT installed
 # by pip into a runtime location — flow only copies it when it sits next to the
-# script (source/AppImage/AUR installs). Shipping it in the sdist keeps the
-# tarball self-contained for those builds.
+# script. Shipping it in the sdist keeps the tarball self-contained.
 include krishna-*.mp3
-
-# Per-platform packaging lives in these folders; include for a complete sdist.
-recursive-include linux *
-recursive-include macos *
-recursive-include windows *
 
 # Never ship build/dev cruft.
 global-exclude __pycache__ *.py[cod] *-ls.txt
