@@ -57,22 +57,10 @@ JSON files under `~/.config/flow/`.
 > flow runs on **Linux and macOS**. It needs nothing beyond Python 3.8+ —
 > optional system tools (below) unlock audio, the visualizer and native dialogs.
 
-### Arch Linux (AUR)
-
-```sh
-yay -S flowtui          # or: paru -S flowtui
-```
-
-### macOS (Homebrew)
-
-```sh
-brew install thepathless/flow/flow
-```
-
 ### pip
 
 ```sh
-pip install flowtui
+pip install flow-focus
 flow
 ```
 

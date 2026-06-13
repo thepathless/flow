@@ -13,7 +13,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flowtui"
+name = "flow-focus"
 version = "1.0.0"
 description = "A mouse-first terminal focus app: Pomodoro timer, nested todos, habit tracker, ambient audio and an app blocker — one file, zero dependencies."
 readme = "README.md"
