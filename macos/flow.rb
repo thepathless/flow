@@ -11,11 +11,11 @@ class FlowTui < Formula
   include Language::Python::Shebang
 
   desc "Mouse-first terminal focus app: Pomodoro, todos, habits, ambient audio, app blocker"
-  homepage "https://github.com/<your-username>/flow"
-  url "https://github.com/<your-username>/flow/archive/refs/tags/v1.0.0.tar.gz"
+  homepage "https://github.com/thepathless/flow"
+  url "https://github.com/thepathless/flow/archive/refs/tags/v1.0.0.tar.gz"
   sha256 "REPLACE_WITH_TARBALL_SHA256"
   license "MIT"
-  head "https://github.com/<your-username>/flow.git", branch: "main"
+  head "https://github.com/thepathless/flow.git", branch: "main"
 
   depends_on "python@3.12"
 

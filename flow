@@ -145,6 +145,36 @@ class ConfigManager:
         except Exception:
             pass
 
+    # Settings that "Reset to Defaults" restores → their factory values. Kept as
+    # one explicit map so the reset can never drift from the __init__ defaults
+    # and so it touches *only* preferences — never user data (study_total,
+    # daily_study, blocked_apps).
+    RESET_DEFAULTS = {
+        "work_dur": 25,
+        "short_break_dur": 5,
+        "long_break_dur": 15,
+        "sessions_before_long": 4,
+        "daily_goal_seconds": 7200,
+        "auto_start": False,
+        "pomodoro_target": 0,
+        "countdown_name": "",
+        "countdown_date": "",
+        "sound_enabled": True,
+        "notifications": True,
+        "visualizer": True,
+        "visualizer_rows": 2,
+        "vis_bars": 60,
+        "vis_amplitude": 100,
+        "block_apps": False,
+    }
+
+    def reset_defaults(self):
+        """Restore every tweakable preference to its factory value, leaving
+        accumulated data (focus history, blocked-app list) untouched."""
+        for key, val in self.RESET_DEFAULTS.items():
+            setattr(self, key, val)
+        self.save()
+
 
 # ==============================================================================
 # NESTED TODO MANAGER — unlimited subtask nesting support
@@ -1846,6 +1876,17 @@ class FlowTUI:
                     self._flash(f"Countdown set → {iso}")
         elif self.input_for == "export_path":
             self._export_stats(val)
+        elif self.input_for == "reset_confirm":
+            if val.strip().lower() in ("y", "yes"):
+                self.cfg.reset_defaults()
+                # Re-sync anything derived from config that the reset changed.
+                if not self.timer_on:
+                    self.timer_sec = self.cfg.work_dur * 60
+                    self.total_sec = self.cfg.work_dur * 60
+                self._alloc()  # visualizer rows may have changed
+                self._flash("Settings reset to defaults")
+            else:
+                self._flash("Reset cancelled")
 
         self.dirty = True
 
@@ -1869,6 +1910,7 @@ class FlowTUI:
         "vis_bars": "format: 20–100",
         "vis_amp": "format: 25–150 (percent)",
         "export_path": "format: folder path (e.g. ~/Desktop) · blank = cancel",
+        "reset_confirm": "type 'yes' to restore all settings · blank = cancel",
     }
 
     def _input_hint(self, target):
@@ -3112,6 +3154,10 @@ class FlowTUI:
         self.rscroll = 0
         self._alloc()
 
+    def _reset_defaults(self):
+        """Prompt for a typed confirmation before restoring factory settings."""
+        self._begin_input("reset_confirm")
+
     @staticmethod
     def _parse_date(val):
         """Parse a human-typed date into normalized 'YYYY-MM-DD'.
@@ -3312,6 +3358,7 @@ class FlowTUI:
             ("Blocked Apps →", f"{len(c.blocked_apps)} apps", self._open_apps),
             H("Data"),
             ("Export Stats →", "json + csv", self._export_choose),
+            ("Reset to Defaults →", "restore settings", self._reset_defaults),
         ]
 
     def _settings_selectable(self, idx):

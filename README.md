@@ -7,9 +7,6 @@ tracker, ambient/lofi audio mixer, and an app blocker, all in one screen.
 - Runs on **Linux, macOS, and Windows**.
 - All state lives under `~/.config/flow/` (`config.json`, `tasks.json`, `habits.json`).
 
-> Replace `<your-username>` below with your GitHub username after you create the repo
-> (see [`github/README.md`](github/README.md) for a first-time upload walkthrough).
-
 ---
 
 ## Install
@@ -27,7 +24,7 @@ tracker, ambient/lofi audio mixer, and an app blocker, all in one screen.
 ### macOS
 
 ```sh
-brew install <your-username>/flow/flow-tui     # once published; see macos/README.md
+brew install thepathless/flow/flow-tui     # once published; see macos/README.md
 # or, simplest, with no extra setup:
 pip3 install flow-tui
 ```
@@ -44,7 +41,7 @@ pip install "flow-tui[windows]"
 ### From source (any OS)
 
 ```sh
-git clone https://github.com/<your-username>/flow.git
+git clone https://github.com/thepathless/flow.git
 cd flow
 ./flow                 # run directly
 ./install.sh           # or install to ~/.local/bin (Linux/macOS)
@@ -93,4 +90,4 @@ github/              first-time "how to upload to GitHub" guide
 
 MIT — see [`LICENSE`](LICENSE). Bundled ambient recordings are CC0/public-domain.
 
-[Releases]: https://github.com/<your-username>/flow/releases
+[Releases]: https://github.com/thepathless/flow/releases

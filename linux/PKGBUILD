@@ -1,4 +1,4 @@
-# Maintainer: <your name> <you@example.com>
+# Maintainer: Suvadeep Mondal suvadeep.apc@gmail.com
 #
 # AUR package for `flow` — a single-file, dependency-free terminal focus app.
 # Install with:  yay -S flow-tui     (or: paru -S flow-tui)
@@ -11,7 +11,7 @@ pkgver=1.0.0
 pkgrel=1
 pkgdesc="Mouse-first terminal focus app: Pomodoro timer, todos, habit tracker, ambient audio and an app blocker"
 arch=('any')
-url="https://github.com/<your-username>/flow"
+url="https://github.com/thepathless/flow"
 license=('MIT')
 depends=('python')
 optdepends=(

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `flow` is a single-file terminal (curses) focus app: Pomodoro timer + nested todo list + daily habit tracker + ambient/lofi audio + an app blocker, with a mouse-first TUI. The **entire application is one ~2800-line Python script** (`./flow`) with **zero Python dependencies** (pure stdlib + `curses`). All persisted state lives under `~/.config/flow/` (`config.json`, `tasks.json`, `habits.json`, plus synthesized/downloaded WAVs in `sounds/`).
 
-There is no build step, no test suite, and no package manifest. `IMPLEMENTATION_PLAN.md` is a handoff doc describing past changes with root cause + exact line locations — read it for historical context on completed tasks, but verify line numbers against the current file since they drift.
+There is no build step, no test suite, and no package manifest.
 
 ## Running & installing
 

@@ -19,7 +19,7 @@ description = "A mouse-first terminal focus app: Pomodoro timer, nested todos, h
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
-authors = [{ name = "<your name>", email = "<you@example.com>" }]
+authors = [{ name = "Suvadeep Mondal", email = "suvadeep.apc@gmail.com" }]
 keywords = ["pomodoro", "tui", "curses", "focus", "productivity", "habit-tracker", "terminal"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -38,9 +38,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/<your-username>/flow"
-Repository = "https://github.com/<your-username>/flow"
-Issues = "https://github.com/<your-username>/flow/issues"
+Homepage = "https://github.com/thepathless/flow"
+Repository = "https://github.com/thepathless/flow"
+Issues = "https://github.com/thepathless/flow/issues"
 
 # Windows note: the bundled `windows-curses` is needed for curses there. It is
 # declared as an OS-conditional extra so Linux/macOS installs stay dependency-free.

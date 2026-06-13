@@ -13,12 +13,12 @@ platform: linux
 version: v1.0.0
 section: utils
 priority: optional
-maintainer: "<your name> <you@example.com>"
+maintainer: "Suvadeep Mondal suvadeep.apc@gmail.com"
 description: |
   Mouse-first terminal focus app: Pomodoro timer, nested to-dos, habit tracker,
   ambient/lofi audio mixer and an app blocker — one dependency-free script.
-vendor: "<your name>"
-homepage: "https://github.com/<your-username>/flow"
+vendor: "Suvadeep Mondal"
+homepage: "https://github.com/thepathless/flow"
 license: "MIT"
 
 depends:

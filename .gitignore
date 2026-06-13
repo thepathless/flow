@@ -27,6 +27,7 @@ src/
 *.swp
 .idea/
 .vscode/
+.claude/
 
 # Stray local dumps (e.g. directory listings captured during development)
 *-ls.txt
