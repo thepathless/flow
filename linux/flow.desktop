@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=flow
+GenericName=Focus Timer
+Comment=Pomodoro timer, to-dos, habit tracker, ambient audio and app blocker in your terminal
+# Launch inside a terminal emulator (flow is a curses TUI).
+Exec=flow
+Icon=flow
+Terminal=true
+Categories=Utility;ConsoleOnly;Office;
+Keywords=pomodoro;focus;timer;todo;habit;productivity;
+StartupNotify=false

@@ -1,0 +1,46 @@
+# nfpm config — build .deb (apt) and .rpm (dnf/zypper) for flow.
+# nfpm needs no native packaging toolchain (https://nfpm.goreleaser.com).
+#
+# Run from the REPOSITORY ROOT (paths below are relative to it):
+#   nfpm pkg -f linux/nfpm.yaml -p deb -t dist/
+#   nfpm pkg -f linux/nfpm.yaml -p rpm -t dist/
+#
+# flow is a pure-Python script, so the package is architecture-independent.
+
+name: flow-tui
+arch: all
+platform: linux
+version: v1.0.0
+section: utils
+priority: optional
+maintainer: "<your name> <you@example.com>"
+description: |
+  Mouse-first terminal focus app: Pomodoro timer, nested to-dos, habit tracker,
+  ambient/lofi audio mixer and an app blocker — one dependency-free script.
+vendor: "<your name>"
+homepage: "https://github.com/<your-username>/flow"
+license: "MIT"
+
+depends:
+  - python3
+# Recommended, not required (graceful degradation at runtime):
+recommends:
+  - mpv
+  - cava
+
+contents:
+  - src: ./flow
+    dst: /usr/bin/flow
+    file_info:
+      mode: 0755
+  - src: ./linux/flow.desktop
+    dst: /usr/share/applications/flow.desktop
+  - src: ./linux/flow.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/flow.svg
+  - src: ./LICENSE
+    dst: /usr/share/licenses/flow-tui/LICENSE
+  # Bundled ambient track (optional). flow auto-loads bundled audio only when it
+  # sits next to the script; from a distro package the other sounds download on
+  # first run, so this is shipped for completeness.
+  - src: ./krishna-theme-krish-theme-flute-cover-by-lakhinandan-lahon.mp3
+    dst: /usr/share/flow/krishna_flute.mp3

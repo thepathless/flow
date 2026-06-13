@@ -1,0 +1,48 @@
+# Packaging metadata for flow — a single-file, zero-dependency terminal focus app.
+#
+# `flow` is a plain Python script (stdlib + curses only), so packaging is just
+# metadata: setup.py installs the `flow` script verbatim (shebang + all) and pip
+# generates the right launcher per OS (a `flow` shim on Linux/macOS, `flow.exe`
+# on Windows). There is nothing to compile and no runtime dependencies.
+#
+# Install from a checkout:   pip install .
+# Build distributables:      python -m build      (produces wheel + sdist)
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flow-tui"
+version = "1.0.0"
+description = "A mouse-first terminal focus app: Pomodoro timer, nested todos, habit tracker, ambient audio and an app blocker — one file, zero dependencies."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "<your name>", email = "<you@example.com>" }]
+keywords = ["pomodoro", "tui", "curses", "focus", "productivity", "habit-tracker", "terminal"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business :: Scheduling",
+    "Topic :: Utilities",
+]
+# No Python dependencies. Optional *system* tools (mpv, paplay, cava, zenity…)
+# are detected at runtime and the app degrades gracefully without them.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/<your-username>/flow"
+Repository = "https://github.com/<your-username>/flow"
+Issues = "https://github.com/<your-username>/flow/issues"
+
+# Windows note: the bundled `windows-curses` is needed for curses there. It is
+# declared as an OS-conditional extra so Linux/macOS installs stay dependency-free.
+[project.optional-dependencies]
+windows = ["windows-curses; sys_platform == 'win32'"]

@@ -1,0 +1,3765 @@
+#!/usr/bin/env python3
+# /// script
+# dependencies = []
+# ///
+# flow — focus timer · blocker · todo · ambient sounds
+# zero external dependencies — pure python + curses
+
+import sys
+import os
+import time
+import math
+import json
+import random
+import struct
+import wave
+import signal
+import atexit
+import threading
+import subprocess
+import shutil
+import urllib.request
+import re
+import curses
+import socket
+try:
+    import pwd  # Unix-only; absent on native Windows (the core TUI still runs there)
+except ImportError:
+    pwd = None
+from datetime import datetime, timedelta
+import calendar as _calendar
+
+# ==============================================================================
+# PATHS
+# ==============================================================================
+def get_user_home():
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and pwd is not None:
+        try:
+            return pwd.getpwnam(sudo_user).pw_dir
+        except Exception:
+            pass
+    return os.path.expanduser("~")
+
+FLOW_DIR = os.path.join(get_user_home(), ".config", "flow")
+SOUNDS_DIR = os.path.join(FLOW_DIR, "sounds")
+CONFIG_PATH = os.path.join(FLOW_DIR, "config.json")
+TASKS_PATH = os.path.join(FLOW_DIR, "tasks.json")
+HABITS_PATH = os.path.join(FLOW_DIR, "habits.json")
+MPV_SOCKET = f"/tmp/flow_mpv_{os.getpid()}"
+CAVA_CONFIG = f"/tmp/flow_cava_{os.getpid()}.conf"
+
+os.makedirs(SOUNDS_DIR, exist_ok=True)
+
+# ==============================================================================
+# SOLID BLOCK BANNER — "flow" in filled block characters
+# ==============================================================================
+FLOW_BANNER = [
+    "██████  ██       ██████  ██      ██",
+    "██      ██      ██    ██ ██      ██",
+    "█████   ██      ██    ██ ██  ██  ██",
+    "██      ██      ██    ██ ██████████",
+    "██      ███████  ██████   ██    ██ ",
+]
+
+# ==============================================================================
+# BIG DIGIT FONT for timer (4 wide × 5 tall)
+# ==============================================================================
+DIGITS = {
+    "0": ["▄▀▀▄", "█  █", "█  █", "█  █", "▀▄▄▀"],
+    "1": [" ▄█ ", "  █ ", "  █ ", "  █ ", " ▄█▄"],
+    "2": ["▄▀▀▄", "   █", " ▄▄▀", "█   ", "█▄▄▄"],
+    "3": ["▄▀▀▄", "   █", " ▀▀▄", "   █", "▀▄▄▀"],
+    "4": ["█  █", "█  █", "▀▀▀█", "   █", "   █"],
+    "5": ["█▀▀▀", "█   ", "▀▀▀▄", "   █", "▀▄▄▀"],
+    "6": ["▄▀▀▄", "█   ", "█▀▀▄", "█  █", "▀▄▄▀"],
+    "7": ["▀▀▀█", "   █", "  █ ", " █  ", " █  "],
+    "8": ["▄▀▀▄", "█  █", "▄▀▀▄", "█  █", "▀▄▄▀"],
+    "9": ["▄▀▀▄", "█  █", "▀▄▄█", "   █", "▀▄▄▀"],
+    ":": ["    ", " ██ ", "    ", " ██ ", "    "],
+}
+
+# ==============================================================================
+# SAFE CURSES WRITE — clips at boundaries, never crashes
+# ==============================================================================
+def saddstr(win, y, x, text, attr=0):
+    try:
+        my, mx = win.getmaxyx()
+        if y < 0 or y >= my or x >= mx:
+            return
+        avail = mx - x - 1
+        if avail <= 0:
+            return
+        win.addstr(y, x, text[:avail], attr)
+    except curses.error:
+        pass
+
+
+# ==============================================================================
+# CONFIG MANAGER
+# ==============================================================================
+class ConfigManager:
+    def __init__(self):
+        self.work_dur = 25
+        self.short_break_dur = 5
+        self.long_break_dur = 15
+        self.sessions_before_long = 4
+        self.sound_enabled = True
+        self.notifications = True
+        self.auto_start_work = False
+        self.auto_start_break = False
+        self.block_apps = False
+        self.clock_24h = True
+        self.blocked_apps = []
+        self.left_panel_width = 30
+        self.study_total = 0  # total study seconds (persistent)
+        self.daily_study = {}  # {"YYYY-MM-DD": seconds} for the stats views
+        self.daily_goal_seconds = 7200  # 2h default daily focus goal
+        self.visualizer = True  # bottom spectrum visualizer on/off
+        self.visualizer_rows = 2  # height of the visualizer strip (1-4)
+        self.vis_bars = 60        # cava bar count (20–100)
+        self.vis_amplitude = 100  # height scaling percent (25–150)
+        self.auto_start = False       # auto-start the next focus/break automatically
+        self.pomodoro_target = 0      # planned focus sessions (0 = unlimited)
+        self.countdown_name = ""      # label for the top-bar countdown
+        self.countdown_date = ""      # "YYYY-MM-DD" target; "" disables it
+        self.load()
+
+    def load(self):
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH, "r") as f:
+                    data = json.load(f)
+                
+                # Clean legacy keys
+                data.pop("block_web", None)
+                data.pop("blocked_domains", None)
+                self.__dict__.update(data)
+            except Exception:
+                pass
+
+    def save(self):
+        try:
+            with open(CONFIG_PATH, "w") as f:
+                json.dump(self.__dict__, f, indent=2)
+        except Exception:
+            pass
+
+
+# ==============================================================================
+# NESTED TODO MANAGER — unlimited subtask nesting support
+# ==============================================================================
+class TodoManager:
+    def __init__(self):
+        self.tasks = []
+        self.load()
+
+    def load(self):
+        if os.path.exists(TASKS_PATH):
+            try:
+                with open(TASKS_PATH, "r") as f:
+                    raw = json.load(f)
+                self.tasks = self._normalize_tasks(raw)
+            except Exception:
+                self.tasks = []
+
+    def _normalize_tasks(self, task_list):
+        normalized = []
+        for t in task_list:
+            if not isinstance(t, dict):
+                continue
+            normalized.append({
+                "id": t.get("id", str(int(time.time() * 1000))),
+                "summary": t.get("summary", ""),
+                "done": t.get("done", t.get("completed", False)),
+                "expanded": t.get("expanded", True),
+                "subtasks": self._normalize_tasks(t.get("subtasks", []))
+            })
+        return normalized
+
+    def save(self):
+        try:
+            with open(TASKS_PATH, "w") as f:
+                json.dump(self.tasks, f, indent=2)
+        except Exception:
+            pass
+
+    def update_states(self):
+        def update_rec(tasks_list):
+            for t in tasks_list:
+                if t.get("subtasks"):
+                    update_rec(t["subtasks"])
+                    t["done"] = all(sub["done"] for sub in t["subtasks"])
+        update_rec(self.tasks)
+
+    def add(self, summary):
+        self.tasks.append({
+            "id": str(int(time.time() * 1000)),
+            "summary": summary,
+            "done": False,
+            "expanded": True,
+            "subtasks": []
+        })
+        self.update_states()
+        self.save()
+
+    def _get_node_by_path(self, path):
+        if not path:
+            return None
+        node = self.tasks[path[0]]
+        for idx in path[1:]:
+            node = node["subtasks"][idx]
+        return node
+
+    def toggle_by_path(self, path):
+        node = self._get_node_by_path(path)
+        if not node:
+            return
+        
+        new_state = not node["done"]
+        
+        def prop_down(n, state):
+            n["done"] = state
+            for sub in n.get("subtasks", []):
+                prop_down(sub, state)
+        
+        prop_down(node, new_state)
+        self.update_states()
+        self.save()
+
+    def add_sibling_by_path(self, path, summary):
+        if not path:
+            self.add(summary)
+            return
+        
+        if len(path) == 1:
+            self.tasks.insert(path[0] + 1, {
+                "id": str(int(time.time() * 1000)),
+                "summary": summary,
+                "done": False,
+                "expanded": True,
+                "subtasks": []
+            })
+        else:
+            parent = self._get_node_by_path(path[:-1])
+            if "subtasks" not in parent:
+                parent["subtasks"] = []
+            parent["subtasks"].insert(path[-1] + 1, {
+                "id": str(int(time.time() * 1000)),
+                "summary": summary,
+                "done": False,
+                "expanded": True,
+                "subtasks": []
+            })
+        self.update_states()
+        self.save()
+
+    def add_subtask_by_path(self, path, summary):
+        node = self._get_node_by_path(path)
+        if not node:
+            return
+        if "subtasks" not in node:
+            node["subtasks"] = []
+        node["subtasks"].append({
+            "id": str(int(time.time() * 1000)),
+            "summary": summary,
+            "done": False,
+            "expanded": True,
+            "subtasks": []
+        })
+        node["expanded"] = True
+        self.update_states()
+        self.save()
+
+    def delete_by_path(self, path):
+        if not path:
+            return
+        if len(path) == 1:
+            self.tasks.pop(path[0])
+        else:
+            parent = self._get_node_by_path(path[:-1])
+            parent["subtasks"].pop(path[-1])
+        self.update_states()
+        self.save()
+
+
+def parse_duration_to_seconds(s):
+    """'21h3m23s' / '2h' / '30m' / '90' (bare = minutes) -> seconds. 0 if invalid."""
+    s = (s or "").strip().lower()
+    if s.isdigit():
+        return int(s) * 60
+    total = 0
+    for val, unit in re.findall(r"(\d+)\s*([hms])", s):
+        total += int(val) * {"h": 3600, "m": 60, "s": 1}[unit]
+    return total
+
+
+def get_visible_tasks(tasks, depth=0, path=None):
+    if path is None:
+        path = []
+    res = []
+    for idx, t in enumerate(tasks):
+        current_path = path + [idx]
+        res.append({
+            "task": t,
+            "depth": depth,
+            "path": current_path
+        })
+        if t.get("expanded", True) and t.get("subtasks"):
+            res.extend(get_visible_tasks(t["subtasks"], depth + 1, current_path))
+    return res
+
+
+def count_all_tasks(tasks):
+    """Count only top-level tasks, not subtasks."""
+    total = len(tasks)
+    done = sum(1 for t in tasks if t["done"])
+    return done, total
+
+
+def count_subtasks(task):
+    subs = task.get("subtasks", [])
+    if not subs:
+        return 0, 0
+    done_cnt = 0
+    tot_cnt = 0
+    for s in subs:
+        tot_cnt += 1
+        if s["done"]:
+            done_cnt += 1
+        if s.get("subtasks"):
+            d, t = count_subtasks(s)
+            done_cnt += d
+            tot_cnt += t
+    return done_cnt, tot_cnt
+
+
+# ==============================================================================
+# HABIT MANAGER — daily habit tracking with streaks
+# ==============================================================================
+class HabitManager:
+    def __init__(self):
+        self.habits = []  # [{id, name, history: {"YYYY-MM-DD": true}}]
+        self.load()
+
+    def load(self):
+        if os.path.exists(HABITS_PATH):
+            try:
+                with open(HABITS_PATH, "r") as f:
+                    raw = json.load(f)
+                out = []
+                for h in raw:
+                    if not isinstance(h, dict):
+                        continue
+                    out.append({
+                        "id": h.get("id", str(int(time.time() * 1000))),
+                        "name": h.get("name", ""),
+                        "history": h.get("history", {}) if isinstance(h.get("history"), dict) else {},
+                    })
+                self.habits = out
+            except Exception:
+                self.habits = []
+
+    def save(self):
+        try:
+            with open(HABITS_PATH, "w") as f:
+                json.dump(self.habits, f, indent=2)
+        except Exception:
+            pass
+
+    @staticmethod
+    def today():
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def add(self, name):
+        self.habits.append({
+            "id": str(int(time.time() * 1000)),
+            "name": name,
+            "history": {},
+        })
+        self.save()
+
+    def delete(self, idx):
+        if 0 <= idx < len(self.habits):
+            self.habits.pop(idx)
+            self.save()
+
+    def rename(self, idx, name):
+        if 0 <= idx < len(self.habits) and name:
+            self.habits[idx]["name"] = name
+            self.save()
+
+    def toggle_today(self, idx):
+        if not (0 <= idx < len(self.habits)):
+            return
+        hist = self.habits[idx]["history"]
+        t = self.today()
+        if hist.get(t):
+            hist.pop(t, None)
+        else:
+            hist[t] = True
+        self.save()
+
+    @staticmethod
+    def done_on(habit, date_str):
+        return bool(habit["history"].get(date_str))
+
+    def streak(self, habit):
+        """Consecutive days up to today (or yesterday if today not yet done)."""
+        hist = habit["history"]
+        if not hist:
+            return 0
+        today = datetime.now().date()
+        # Allow the streak to count from today if done, else from yesterday so an
+        # unchecked 'today' doesn't instantly zero a long run.
+        start = today if hist.get(today.strftime("%Y-%m-%d")) else today - timedelta(days=1)
+        count = 0
+        d = start
+        while hist.get(d.strftime("%Y-%m-%d")):
+            count += 1
+            d -= timedelta(days=1)
+        return count
+
+
+# ==============================================================================
+# AUDIO SYNTHESIS (offline noise generation)
+# ==============================================================================
+class AudioSynthesizer:
+    # Bump this when a generator changes so existing installs regenerate.
+    NOISE_VERSION = "2"
+
+    @staticmethod
+    def synthesize_all(progress_cb=None):
+        os.makedirs(SOUNDS_DIR, exist_ok=True)
+        # Regenerate the noise loops when the algorithm version changes (smoother
+        # pink/brown + longer loops to kill the "harsh static" loop seam).
+        vfile = os.path.join(SOUNDS_DIR, ".noise_version")
+        cur = ""
+        try:
+            with open(vfile) as f:
+                cur = f.read().strip()
+        except OSError:
+            pass
+        if cur != AudioSynthesizer.NOISE_VERSION:
+            for old in ("white.wav", "pink.wav", "brown.wav"):
+                try:
+                    os.unlink(os.path.join(SOUNDS_DIR, old))
+                except OSError:
+                    pass
+        jobs = [
+            ("white.wav", AudioSynthesizer._white, "Synthesizing white noise…"),
+            ("pink.wav", AudioSynthesizer._pink, "Synthesizing pink noise…"),
+            ("brown.wav", AudioSynthesizer._brown, "Synthesizing brownian noise…"),
+            ("storm.wav", AudioSynthesizer._storm, "Synthesizing thunderstorm…"),
+            ("alpha.wav", AudioSynthesizer._alpha, "Synthesizing alpha waves…"),
+            ("rain.wav", AudioSynthesizer._rain, "Synthesizing rain ambience…"),
+        ]
+        for i, (fname, gen, desc) in enumerate(jobs):
+            path = os.path.join(SOUNDS_DIR, fname)
+            if not os.path.exists(path):
+                if progress_cb:
+                    progress_cb(desc, int(i / len(jobs) * 100))
+                gen(path)
+        try:
+            with open(vfile, "w") as f:
+                f.write(AudioSynthesizer.NOISE_VERSION)
+        except OSError:
+            pass
+        if progress_cb:
+            progress_cb("Ready!", 100)
+
+    @staticmethod
+    def _write_samples(filepath, gen_fn, duration=10, sr=44100):
+        n = duration * sr
+        with wave.open(filepath, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            buf = []
+            for sample in gen_fn(n):
+                buf.append(struct.pack("<h", sample))
+                if len(buf) >= 4096:
+                    w.writeframes(b"".join(buf))
+                    buf = []
+            if buf:
+                w.writeframes(b"".join(buf))
+
+    @staticmethod
+    def _white(path):
+        # Gentle 1-pole low-pass softens the harshest top end (less piercing
+        # "hiss") while staying broadband. 20s loop reduces the audible seam.
+        def gen(n):
+            lp = 0.0
+            for _ in range(n):
+                wn = random.uniform(-1, 1)
+                lp = lp * 0.18 + wn * 0.82
+                yield int(max(-1, min(1, lp)) * 32767 * 0.55)
+        AudioSynthesizer._write_samples(path, gen, duration=20)
+
+    @staticmethod
+    def _pink(path):
+        # Voss-McCartney pink noise, lightly smoothed for a softer texture.
+        def gen(n):
+            rows = [0.0] * 12
+            rs = 0.0
+            lp = 0.0
+            for i in range(n):
+                if i > 0:
+                    tz = (i & -i).bit_length() - 1
+                    if tz < 12:
+                        rs -= rows[tz]
+                        rows[tz] = random.uniform(-1, 1) / 12
+                        rs += rows[tz]
+                w = random.uniform(-1, 1) / 12
+                lp = lp * 0.35 + (rs + w) * 0.65
+                yield int(max(-1, min(1, lp)) * 32767 * 0.72)
+        AudioSynthesizer._write_samples(path, gen, duration=20)
+
+    @staticmethod
+    def _brown(path):
+        # Deeper, softer brownian rumble: stronger integration + low-pass so it
+        # reads as a warm "waterfall", not bright static.
+        def gen(n):
+            c = 0.0
+            lp = 0.0
+            for _ in range(n):
+                c += random.uniform(-1, 1) * 0.05
+                c *= 0.985
+                lp = lp * 0.55 + c * 0.45
+                yield int(max(-1, min(1, lp * 1.6)) * 32767 * 0.62)
+        AudioSynthesizer._write_samples(path, gen, duration=20)
+
+    @staticmethod
+    def _storm(path):
+        """Enhanced thunderstorm: layered rain, deep rolling thunder, wind gusts."""
+        def gen(n):
+            sr = 44100
+            # Pink noise state for rain
+            rows = [0.0] * 16
+            rs = 0.0
+            # Brown noise for low rumble
+            brown = 0.0
+            # Thunder envelope
+            thunder_env = 0.0
+            thunder_decay = 0.99985  # Slower decay for rolling thunder
+            # Wind
+            wind_phase = 0.0
+            wind_speed = random.uniform(0.3, 0.7)
+            for i in range(n):
+                t = i / sr
+                # Pink noise rain layer
+                if i > 0:
+                    tz = (i & -i).bit_length() - 1
+                    if tz < 16:
+                        rs -= rows[tz]
+                        rows[tz] = random.uniform(-1, 1) / 16
+                        rs += rows[tz]
+                w = random.uniform(-1, 1) / 16
+                rain = max(-1, min(1, rs + w))
+                # Shape rain with subtle high-freq emphasis
+                rain_shaped = rain * 0.70
+                # Deep brownian rumble
+                brown += random.uniform(-1, 1) * 0.04
+                brown *= 0.997
+                rumble = max(-1, min(1, brown)) * 0.30
+                # Wind gusts (slow modulation)
+                wind_phase += wind_speed / sr
+                wind_mod = (math.sin(2 * math.pi * 0.08 * t) * 0.5 + 0.5)
+                wind_mod *= (math.sin(2 * math.pi * 0.03 * t + 1.7) * 0.3 + 0.7)
+                wind = random.uniform(-1, 1) * wind_mod * 0.15
+                # Thunder strikes — less frequent but more dramatic
+                if random.random() < 0.000008:
+                    thunder_env = random.uniform(0.8, 1.0)
+                clap = 0.0
+                if thunder_env > 0.0005:
+                    # Multi-layered thunder: crack + rumble
+                    crack = random.uniform(-1, 1) * thunder_env * 0.5
+                    low_rumble = math.sin(2 * math.pi * (30 + random.uniform(-5, 5)) * t) * thunder_env * 0.3
+                    clap = crack + low_rumble
+                    thunder_env *= thunder_decay
+                sample = rain_shaped + rumble + wind + clap
+                yield int(max(-1, min(1, sample)) * 32767 * 0.85)
+        AudioSynthesizer._write_samples(path, gen, duration=15)
+
+    @staticmethod
+    def _rain(path):
+        """Pure rain ambience — gentle steady rainfall."""
+        def gen(n):
+            rows = [0.0] * 14
+            rs = 0.0
+            for i in range(n):
+                if i > 0:
+                    tz = (i & -i).bit_length() - 1
+                    if tz < 14:
+                        rs -= rows[tz]
+                        rows[tz] = random.uniform(-1, 1) / 14
+                        rs += rows[tz]
+                w = random.uniform(-1, 1) / 14
+                rain = max(-1, min(1, rs + w)) * 0.80
+                # Add occasional drip droplets
+                drip = 0.0
+                if random.random() < 0.0002:
+                    drip = math.sin(2 * math.pi * random.uniform(2000, 5000) * i / 44100) * 0.25
+                yield int(max(-1, min(1, rain + drip)) * 32767 * 0.80)
+        AudioSynthesizer._write_samples(path, gen)
+
+    @staticmethod
+    def _alpha(path):
+        def gen(n):
+            sr = 44100
+            c = 0.0
+            for i in range(n):
+                t = i / sr
+                beat = (math.sin(2 * math.pi * 100 * t) + math.sin(2 * math.pi * 110 * t)) * 0.5
+                c += random.uniform(-1, 1) * 0.03
+                c *= 0.995
+                rumble = max(-1, min(1, c)) * 0.15
+                val = beat * 0.5 + rumble * 0.5
+                yield int(max(-1, min(1, val)) * 32767 * 0.80)
+        AudioSynthesizer._write_samples(path, gen)
+
+
+# ==============================================================================
+# AMBIENT RECORDINGS — real CC0/public-domain sounds, downloaded on first run
+# ==============================================================================
+# Verified reachable 2026-06-13. key -> (url, local filename)
+SOUND_DOWNLOADS = {
+    # Pure rain, no thunder (1m22s loop) — fixes the "rain has thunder" report.
+    "rain":      ("https://upload.wikimedia.org/wikipedia/commons/4/41/Rain_against_the_window.ogg", "rain_window.ogg"),
+    "thunder":   ("https://upload.wikimedia.org/wikipedia/commons/b/b1/Thunderstorm_after_hot_summer_day_17_minutes_02_of_04.ogg", "thunder.ogg"),
+    # Sea waves with clear swell — distinct from the forest-wind recording.
+    "ocean":     ("https://upload.wikimedia.org/wikipedia/commons/e/e9/Adriatic_Sea_waves.ogg", "ocean_waves.ogg"),
+    "fireplace": ("https://archive.org/download/ronkoster2023-fireplace-with-crackling-sounds-2-min-rk-178392/ronkoster2023-fireplace-with-crackling-sounds-2-min-rk-178392.mp3", "fireplace.mp3"),
+    "birds":     ("https://upload.wikimedia.org/wikipedia/commons/e/e7/Birdsong_morning_01.ogg", "birds.ogg"),
+    "cafe":      ("https://archive.org/download/453074-c-rogers-370973-waweee-coffee-shop-ambience-remastered/453074__c_rogers__370973__waweee__coffee-shop-ambience_remastered.mp3", "cafe.mp3"),
+    "wind":      ("https://upload.wikimedia.org/wikipedia/commons/f/f3/Wind_in_Swedish_pine_forest_at_25_mps.ogg", "wind.ogg"),
+}
+
+
+def _install_krishna_flute():
+    """Copy the Krishna flute MP3 bundled next to this script into SOUNDS_DIR."""
+    dest = os.path.join(SOUNDS_DIR, "krishna_flute.mp3")
+    if os.path.exists(dest) and os.path.getsize(dest) > 1024:
+        return
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        for cand in os.listdir(script_dir):
+            if cand.lower().endswith(".mp3") and "krishna" in cand.lower():
+                shutil.copyfile(os.path.join(script_dir, cand), dest)
+                return
+    except Exception:
+        pass
+
+
+def download_sounds(progress_cb=None):
+    """Fetch real recordings on first run. Missing files are left missing so the
+    AudioEngine can fall back to a synthesized WAV (never silent)."""
+    os.makedirs(SOUNDS_DIR, exist_ok=True)
+    _install_krishna_flute()
+    items = list(SOUND_DOWNLOADS.items())
+    for i, (key, (url, fname)) in enumerate(items):
+        dest = os.path.join(SOUNDS_DIR, fname)
+        if os.path.exists(dest) and os.path.getsize(dest) > 1024:
+            continue
+        tmp = dest + ".part"
+        # Retry: archive.org download nodes can be slow to warm up on a cold
+        # request (occasionally >30s the first time, fast after). 3 tries.
+        for attempt in range(3):
+            if progress_cb:
+                suffix = "…" if attempt == 0 else f" (retry {attempt})…"
+                progress_cb(f"Downloading {key}{suffix}", int(i / max(1, len(items)) * 100))
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "flow-tui/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+                    while True:
+                        chunk = r.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                os.replace(tmp, dest)
+                break  # success
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                time.sleep(1.5)
+                # after final attempt: leave missing → falls back to synth/None
+
+
+# ==============================================================================
+# AUDIO ENGINE — mpv via JSON IPC socket (reliable)
+# ==============================================================================
+class AudioEngine:
+    def __init__(self, config):
+        self.config = config
+        self.mpv_proc = None
+        self.current_sound_idx = 0
+        self.volume = 50
+        self.is_playing = False
+        self._lock = threading.Lock()      # serialize IPC across UI + watchdog threads
+        self._watchdog_on = True
+        self.sounds = [
+            {"name": "None", "type": "none", "files": []},
+            {"name": "🌧 Rain",         "type": "local", "files": ["rain_window.ogg", "rain.ogg", "rain.wav"]},
+            {"name": "⛈ Thunderstorm",  "type": "local", "files": ["thunder.ogg", "storm.wav"]},
+            {"name": "🌊 Ocean Waves",  "type": "local", "files": ["ocean_waves.ogg", "ocean.mp3", "ocean.wav"]},
+            {"name": "🔥 Fireplace",    "type": "local", "files": ["fireplace.mp3", "fire.wav"]},
+            {"name": "🐦 Birds",        "type": "local", "files": ["birds.ogg", "birds.wav"]},
+            {"name": "☕ Café",         "type": "local", "files": ["cafe.mp3", "cafe.wav"]},
+            {"name": "💨 Wind",         "type": "local", "files": ["wind.ogg", "wind.wav"]},
+            {"name": "🎵 Krishna Flute","type": "local", "files": ["krishna_flute.mp3"]},
+            {"name": "〰 Alpha Waves",   "type": "local", "files": ["alpha.wav"]},
+            {"name": "White Noise",     "type": "local", "files": ["white.wav"]},
+            {"name": "Pink Noise",      "type": "local", "files": ["pink.wav"]},
+            {"name": "Brown Noise",     "type": "local", "files": ["brown.wav"]},
+            {"name": "📻 Lofi Radio",   "type": "stream", "path": "http://stream.zeno.fm/0r0xa792kwzuv"},
+        ]
+        # Multi-sound mixer: one mpv process per active sound, keyed by sound idx.
+        self.instances = {}   # idx -> {"proc": Popen, "sock": path, "type": str}
+        self.muted = False
+        # Watchdog reconnects dropped network streams so playback never dies.
+        self._watchdog_thread = threading.Thread(target=self._watchdog, daemon=True)
+        self._watchdog_thread.start()
+
+    def resolve_path(self, sound):
+        """Return the first existing file for a sound, or None if unavailable."""
+        if sound.get("type") == "stream":
+            return sound.get("path")
+        for fn in sound.get("files", []):
+            p = os.path.join(SOUNDS_DIR, fn)
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _sock_path(self, idx):
+        return f"{MPV_SOCKET}_{idx}"
+
+    def _spawn_mpv(self, sock):
+        try:
+            os.unlink(sock)
+        except OSError:
+            pass
+        try:
+            proc = subprocess.Popen(
+                ["mpv", "--idle", "--quiet", "--no-video",
+                 f"--input-ipc-server={sock}",
+                 "--cache=yes", "--cache-secs=60",
+                 "--demuxer-readahead-secs=60",
+                 "--demuxer-max-bytes=64MiB",
+                 "--demuxer-max-back-bytes=32MiB",
+                 "--network-timeout=0",
+                 "--stream-lavf-o-append=reconnect=1",
+                 "--stream-lavf-o-append=reconnect_streamed=1",
+                 "--stream-lavf-o-append=reconnect_on_network_error=1",
+                 "--stream-lavf-o-append=reconnect_delay_max=60"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return None
+        for _ in range(30):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.05)
+        return proc
+
+    def _cmd_sock(self, sock, *args):
+        try:
+            with self._lock:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                s.connect(sock)
+                s.sendall((json.dumps({"command": list(args)}) + "\n").encode())
+                s.close()
+        except Exception:
+            pass
+
+    def _get_sock(self, sock, prop):
+        try:
+            with self._lock:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                s.connect(sock)
+                s.sendall((json.dumps({"command": ["get_property", prop]}) + "\n").encode())
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                s.close()
+            for line in buf.split(b"\n"):
+                if not line.strip():
+                    continue
+                msg = json.loads(line.decode())
+                if msg.get("error") == "success" and "data" in msg:
+                    return msg["data"]
+        except Exception:
+            return None
+        return None
+
+    def _start_instance(self, idx):
+        """Spawn an mpv for sound idx and begin looping it. Returns True on success."""
+        sound = self.sounds[idx]
+        path = self.resolve_path(sound)
+        if not path:
+            return False
+        sock = self._sock_path(idx)
+        proc = self._spawn_mpv(sock)
+        if not proc:
+            return False
+        self._cmd_sock(sock, "loadfile", path, "replace")
+        time.sleep(0.05)
+        self._cmd_sock(sock, "set_property", "loop-file", "inf")
+        time.sleep(0.02)
+        self._cmd_sock(sock, "set_property", "volume", 0 if self.muted else self.volume)
+        self._cmd_sock(sock, "set_property", "pause", False)
+        self.instances[idx] = {"proc": proc, "sock": sock, "type": sound["type"]}
+        return True
+
+    def _stop_instance(self, idx):
+        inst = self.instances.pop(idx, None)
+        if not inst:
+            return
+        try:
+            inst["proc"].terminate()
+            inst["proc"].wait(timeout=1)
+        except Exception:
+            try:
+                inst["proc"].kill()
+            except Exception:
+                pass
+        try:
+            os.unlink(inst["sock"])
+        except OSError:
+            pass
+
+    def _refresh_state(self):
+        self.is_playing = bool(self.instances) and not self.muted
+        if self.instances:
+            if self.current_sound_idx not in self.instances:
+                self.current_sound_idx = sorted(self.instances)[0]
+        else:
+            self.current_sound_idx = 0
+
+    def toggle_sound(self, idx):
+        """Add/remove a sound from the simultaneous mix (mouse + Enter entry point)."""
+        if idx == 0:                 # the "None" row clears the whole mix
+            self.stop()
+            return
+        if not self.config.sound_enabled:
+            return
+        if idx in self.instances:
+            self._stop_instance(idx)
+        else:
+            if self._start_instance(idx):
+                self.current_sound_idx = idx
+                self.muted = False
+        self._refresh_state()
+
+    # Back-compat alias — older call sites (and the watchdog) used play().
+    def play(self, idx):
+        self.toggle_sound(idx)
+
+    def is_active(self, idx):
+        return idx in self.instances and not self.muted
+
+    def active_count(self):
+        return len(self.instances)
+
+    def status_label(self):
+        """Short 'now playing' label for the home/timer footer."""
+        if not self.instances:
+            return ""
+        names = [self.sounds[i]["name"] for i in sorted(self.instances)]
+        head = names[0]
+        extra = len(names) - 1
+        return head + (f" +{extra}" if extra else "")
+
+    def stop(self):
+        for idx in list(self.instances):
+            self._stop_instance(idx)
+        self.is_playing = False
+        self.current_sound_idx = 0
+
+    def toggle(self):
+        """Mute/unmute the whole mix (keeps the selection)."""
+        if not self.instances:
+            return
+        self.muted = not self.muted
+        vol = 0 if self.muted else self.volume
+        for inst in self.instances.values():
+            self._cmd_sock(inst["sock"], "set_property", "volume", vol)
+        self.is_playing = bool(self.instances) and not self.muted
+
+    def set_volume(self, vol):
+        self.volume = max(0, min(100, vol))
+        if not self.muted:
+            for inst in self.instances.values():
+                self._cmd_sock(inst["sock"], "set_property", "volume", self.volume)
+
+    def _watchdog(self):
+        """Reload any network-stream instance that drops while we expect playback."""
+        while self._watchdog_on:
+            time.sleep(2.0)
+            try:
+                for idx, inst in list(self.instances.items()):
+                    if inst["type"] != "stream":
+                        continue
+                    sock = inst["sock"]
+                    if (inst["proc"].poll() is not None
+                            or self._get_sock(sock, "eof-reached") is True
+                            or self._get_sock(sock, "idle-active") is True):
+                        self._stop_instance(idx)
+                        self._start_instance(idx)
+            except Exception:
+                pass
+
+    def one_shot(self, name):
+        if not self.config.sound_enabled:
+            return
+        paths = {
+            "work": "/usr/share/sounds/freedesktop/stereo/complete.oga",
+            "break": "/usr/share/sounds/freedesktop/stereo/bell.oga",
+            "alarm": "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
+        }
+        p = paths.get(name)
+        if p and os.path.exists(p):
+            subprocess.Popen(
+                ["paplay", p],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+
+    def shutdown(self):
+        self._watchdog_on = False
+        self.stop()  # terminates every per-sound mpv + unlinks its socket
+
+
+# ==============================================================================
+# BLOCKER ENGINE — kills blocked apps during focus, allows during break
+# ==============================================================================
+_PKG_NOISE = {"bin", "git", "debug", "stable", "real", "app", "appimage", "flatpak"}
+
+
+def name_tokens(s):
+    """Split a name/path into lowercase alphanumeric tokens, dropping packaging
+    noise. Splits on ANY non-alphanumeric (incl. '/' in cmdline paths) so a
+    blocked 'google-chrome' matches the cmdline '/opt/google/chrome/chrome'."""
+    toks = set(re.split(r"[^a-z0-9]+", s.lower()))
+    toks.discard("")
+    return toks - _PKG_NOISE
+
+
+def clean_proc_name(name):
+    """Back-compat: a normalized display string (space-joined significant tokens)."""
+    return " ".join(sorted(name_tokens(name)))
+
+
+class BlockerEngine:
+    def __init__(self, config):
+        self.config = config
+        self.running = False
+        self.is_break = False  # set by timer to allow apps during break
+        self.thread = None
+        self.my_pid = os.getpid()
+
+    def start(self, is_break=False):
+        self.is_break = is_break
+        if not self.running:
+            self.running = True
+            self.thread = threading.Thread(target=self._loop, daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.5)
+
+    def set_break(self, is_break):
+        self.is_break = is_break
+
+    def _find_pids(self):
+        pids = []
+        # Pre-tokenize each blocked entry once; drop entries that tokenize empty.
+        blocked = [(b, name_tokens(b)) for b in self.config.blocked_apps if b.strip()]
+        blocked = [(b, t) for (b, t) in blocked if t]
+        if not blocked:
+            return pids
+        try:
+            for name in os.listdir("/proc"):
+                if not name.isdigit():
+                    continue
+                pid = int(name)
+                if pid == self.my_pid:
+                    continue  # never kill ourselves
+                try:
+                    with open(f"/proc/{pid}/comm", "r") as f:
+                        comm = f.read().strip()
+                    with open(f"/proc/{pid}/cmdline", "r") as f:
+                        cmdline = f.read().replace("\x00", " ").strip()
+                    # Process tokens = comm + the executable path (first cmdline arg).
+                    # Using only argv[0] avoids matching a browser by a URL argument.
+                    argv0 = cmdline.split(" ", 1)[0] if cmdline else ""
+                    ptoks = name_tokens(comm) | name_tokens(argv0)
+                    for b, btoks in blocked:
+                        # Match when every significant token of the blocked name is
+                        # present in the process tokens (order-independent, path-safe).
+                        if btoks <= ptoks:
+                            pids.append(pid)
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return pids
+
+    def _loop(self):
+        # Block whenever enabled and not on a break. This runs continuously
+        # (independent of the focus timer) so toggling the blocker in Settings
+        # takes effect immediately, even with no timer running.
+        kill_attempts = {}  # pid -> attempts (escalate SIGTERM -> SIGKILL)
+        try:
+            my_pgid = os.getpgrp()
+        except Exception:
+            my_pgid = -1
+        while self.running:
+            if self.config.block_apps and not self.is_break:
+                alive = set()
+                for pid in self._find_pids():
+                    alive.add(pid)
+                    attempts = kill_attempts.get(pid, 0)
+                    sig = signal.SIGKILL if attempts >= 2 else signal.SIGTERM
+                    try:
+                        try:
+                            pgid = os.getpgid(pid)
+                        except Exception:
+                            pgid = -1
+                        # Kill the whole process group so a flatpak/bwrap sandbox
+                        # and its children die together — but never our own group.
+                        if pgid > 0 and pgid != my_pgid:
+                            os.killpg(pgid, sig)
+                        else:
+                            os.kill(pid, sig)
+                    except Exception:
+                        pass
+                    kill_attempts[pid] = attempts + 1
+                # Forget pids that are gone so a relaunch restarts at SIGTERM.
+                for dead in [p for p in kill_attempts if p not in alive]:
+                    del kill_attempts[dead]
+            else:
+                kill_attempts.clear()
+            time.sleep(0.5)
+
+
+# ==============================================================================
+# SPECTRUM VISUALIZER — cliamp-style look (github.com/bjarneo/cliamp)
+# mpv owns the audio so we can't tap raw PCM; bands are driven procedurally by
+# play state + volume, but the *rendering* matches cliamp exactly: 9-level
+# fractional blocks, fast-attack / slow-decay smoothing, per-row colour tiers.
+# ==============================================================================
+class Visualizer:
+    BLOCKS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+
+    def __init__(self):
+        self.n = 14  # internal band targets (interpolated to terminal width)
+        self.smoothed = [0.0] * self.n
+        self.frame = 0
+        # Per-band phase/speed give each bar its own organic motion.
+        self._phase = [(i * 0.7) % (2 * math.pi) for i in range(self.n)]
+        self._speed = [0.55 + 0.05 * (i % 7) for i in range(self.n)]
+
+    def tick(self, playing, volume):
+        self.frame += 1
+        t = self.frame * 0.09
+        v = max(0.0, min(1.0, volume / 100.0))
+        for i in range(self.n):
+            if not playing:
+                target = 0.0
+            else:
+                # Bass-heavy weighting: lower bands sit taller, like real spectra.
+                bass = 1.0 - (i / self.n) * 0.45
+                osc = math.sin(t * self._speed[i] + self._phase[i]) * 0.5 + 0.5
+                osc2 = math.sin(t * self._speed[i] * 2.3 + i) * 0.5 + 0.5
+                target = v * bass * (0.45 * osc + 0.35 * osc2 + 0.20 * random.random())
+                target = max(0.0, min(1.0, target))
+            cur = self.smoothed[i]
+            if target > cur:          # fast attack
+                cur = target * 0.6 + cur * 0.4
+            else:                     # slow decay
+                cur = target * 0.25 + cur * 0.75
+            self.smoothed[i] = cur
+
+    def is_idle(self):
+        return all(b < 0.01 for b in self.smoothed)
+
+    def columns(self, width):
+        """Interpolate the internal bands up to `width` per-column levels."""
+        if width <= 0:
+            return []
+        if self.n == 1:
+            return [self.smoothed[0]] * width
+        last = self.n - 1
+        out = []
+        for c in range(width):
+            pos = (c / (width - 1) * last) if width > 1 else 0.0
+            idx = int(pos)
+            frac = pos - idx
+            a = self.smoothed[idx]
+            b = self.smoothed[min(idx + 1, last)]
+            out.append(a * (1 - frac) + b * frac)
+        return out
+
+
+# ==============================================================================
+# CAVA ENGINE — real audio-reactive spectrum (optional; needs the `cava` binary)
+# ==============================================================================
+class CavaEngine:
+    """Drives the spectrum from real audio via cava reading the default output
+    monitor (where mpv plays). Falls back to nothing if cava is absent — the
+    caller then uses the procedural Visualizer."""
+
+    def __init__(self, bars=60):
+        self.bars = max(8, min(200, bars))
+        self.values = [0.0] * self.bars   # normalized 0..1, newest frame
+        self.proc = None
+        self.alive = False
+        self._thread = None
+
+    @staticmethod
+    def available():
+        return shutil.which("cava") is not None
+
+    def _write_config(self):
+        conf = (
+            "[general]\n"
+            "framerate = 30\n"
+            f"bars = {self.bars}\n"
+            "[input]\n"
+            "method = pulse\n"
+            "source = auto\n"
+            "[output]\n"
+            "method = raw\n"
+            "raw_target = /dev/stdout\n"
+            "data_format = ascii\n"
+            "ascii_max_range = 1000\n"
+            "bar_delimiter = 59\n"
+            "frame_delimiter = 10\n"
+        )
+        with open(CAVA_CONFIG, "w") as f:
+            f.write(conf)
+
+    def start(self):
+        if not self.available():
+            return False
+        try:
+            self._write_config()
+            self.proc = subprocess.Popen(
+                ["cava", "-p", CAVA_CONFIG],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            self.proc = None
+            return False
+        self.alive = True
+        self._thread = threading.Thread(target=self._read, daemon=True)
+        self._thread.start()
+        return True
+
+    def _read(self):
+        while self.alive and self.proc and self.proc.stdout:
+            try:
+                line = self.proc.stdout.readline()
+            except Exception:
+                break
+            if not line:
+                break
+            try:
+                parts = line.decode("ascii", "ignore").strip().split(";")
+                vals = [int(x) for x in parts if x.strip().isdigit()]
+                if vals:
+                    self.values = [min(1.0, v / 1000.0) for v in vals]
+            except Exception:
+                pass
+
+    def has_signal(self):
+        return self.alive and self.proc is not None and self.proc.poll() is None
+
+    def columns(self, width):
+        """Interpolate cava bars to `width` columns (same contract as Visualizer.columns)."""
+        vals = self.values
+        n = len(vals)
+        if width <= 0 or n == 0:
+            return []
+        if n == 1:
+            return [vals[0]] * width
+        out, last = [], n - 1
+        for c in range(width):
+            pos = (c / (width - 1) * last) if width > 1 else 0.0
+            i = int(pos)
+            frac = pos - i
+            out.append(vals[i] * (1 - frac) + vals[min(i + 1, last)] * frac)
+        return out
+
+    def stop(self):
+        self.alive = False
+        if self.proc:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=1)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        try:
+            os.unlink(CAVA_CONFIG)
+        except OSError:
+            pass
+
+
+# ==============================================================================
+# FLOW TUI
+# ==============================================================================
+class FlowTUI:
+    # Views
+    HOME = 0
+    TIMER = 1
+    SOUNDS = 2
+    SETTINGS = 3
+    APPS = 4
+    STATS = 5
+    SYNTH = 6
+    APPS_SEARCH = 7
+
+    # Panels
+    LEFT = 0
+    RIGHT = 1
+
+    # Left-panel sections
+    SEC_TODO = 0
+    SEC_HABITS = 1
+
+    def __init__(self):
+        self.cfg = ConfigManager()
+        self.todo = TodoManager()
+        self.habits = HabitManager()
+        self.audio = AudioEngine(self.cfg)
+        self.blocker = BlockerEngine(self.cfg)
+        # Run the blocker continuously; its loop checks cfg.block_apps each pass,
+        # so enabling it in Settings blocks immediately without needing a timer.
+        self.blocker.start()
+
+        self.view = self.HOME
+        self.panel = self.RIGHT
+        self.left_section = self.SEC_TODO
+        self.left_w = self.cfg.left_panel_width
+
+        # Cursor positions
+        self.lcur = 0
+        self.rcur = 0
+        self.hcur = 0   # habits cursor
+
+        # Scroll positions
+        self.lscroll = 0
+        self.rscroll = 0
+        self.hscroll = 0  # habits panel scroll offset
+
+        # Timer states
+        self.timer_on = False
+        self.timer_paused = False
+        self.is_break = False
+        self.break_count = 0
+        self.timer_sec = self.cfg.work_dur * 60
+        self.total_sec = self.cfg.work_dur * 60
+        self.poms_done = 0
+        self.last_tick_time = 0
+
+        # Study stopwatch (counts up)
+        self.study_session = 0  # seconds this session
+        self.stopwatch_on = False  # standalone stopwatch mode
+        self.last_study_tick = 0
+
+        # Spinner
+        self.spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.spin_i = 0
+
+        # Interactive input
+        self.input_mode = False
+        self.input_buf = ""
+        self.input_for = ""
+
+        # Synthesis progress
+        self.synth_pct = 0
+        self.synth_desc = ""
+
+        # Clickable buttons layout cache
+        self.buttons = {}
+        self.dirty = True
+        self.running_loop = True
+
+        # Help overlay
+        self.show_help = False
+
+        # Window handles (built in _alloc)
+        self.hwin = None
+        self._todo_h = 0
+
+        # Stats view: 0=daily 1=weekly 2=calendar; month offset for calendar nav
+        self.stats_mode = 0
+        self.cal_offset = 0
+
+        # Bottom spectrum visualizer
+        self.vis = Visualizer()
+        # Real audio-reactive spectrum when the `cava` binary is available;
+        # otherwise cava_on stays False and we fall back to the procedural one.
+        self.cava = CavaEngine(bars=self.cfg.vis_bars)
+        self.cava_on = self.cava.start()
+        self._vis_h_cur = 0   # current strip height baked into the window layout
+        self._vis_row0 = 0    # first screen row of the visualizer strip
+
+        # Fuzzy Installed Apps Cache
+        self.installed_apps = ["loading apps..."]
+        self.app_search_results = ["loading apps..."]
+        self.app_search_q = ""
+        self.fetch_installed_apps()
+
+    def fetch_installed_apps(self):
+        def task():
+            apps = set()
+            try:
+                res = subprocess.run(["pacman", "-Qq"], capture_output=True, text=True, timeout=3)
+                if res.returncode == 0:
+                    for line in res.stdout.splitlines():
+                        if line.strip():
+                            apps.add(line.strip())
+            except Exception:
+                pass
+            try:
+                res = subprocess.run(["flatpak", "list", "--app", "--columns=name"], capture_output=True, text=True, timeout=3)
+                if res.returncode == 0:
+                    for line in res.stdout.splitlines():
+                        if line.strip() and not line.startswith("Name"):
+                            apps.add(line.strip().lower())
+            except Exception:
+                pass
+            try:
+                res = subprocess.run(["snap", "list"], capture_output=True, text=True, timeout=3)
+                if res.returncode == 0:
+                    for line in res.stdout.splitlines()[1:]:
+                        parts = line.split()
+                        if parts:
+                            apps.add(parts[0].lower())
+            except Exception:
+                pass
+            for d in ["/usr/share/applications", os.path.expanduser("~/.local/share/applications")]:
+                if os.path.exists(d):
+                    try:
+                        for f in os.listdir(d):
+                            if f.endswith(".desktop"):
+                                with open(os.path.join(d, f), "r", errors="ignore") as file:
+                                    for line in file:
+                                        if line.startswith("Name="):
+                                            name = line.replace("Name=", "").strip().lower()
+                                            if name:
+                                                apps.add(name)
+                                            break
+                    except Exception:
+                        pass
+            # Deduplicate: collapse -bin/-git/-debug variants, prefer the base name.
+            def base(a):
+                a = a.lower()
+                for suf in ("-bin", "-git", "-debug", "-stable"):
+                    if a.endswith(suf):
+                        a = a[: -len(suf)]
+                return a.replace("-", " ").replace("_", " ").strip()
+            norm_map = {}
+            for app in sorted(apps):
+                k = base(app)
+                # keep the shortest/prettiest representative for each base name
+                if k not in norm_map or len(app) < len(norm_map[k]):
+                    norm_map[k] = app
+            self.installed_apps = sorted(norm_map.values())
+            self.app_search_results = self.installed_apps[:]
+            self.dirty = True
+        threading.Thread(target=task, daemon=True).start()
+
+    def update_app_search(self):
+        q = self.app_search_q.strip().lower()
+        if not q:
+            self.app_search_results = self.installed_apps[:]
+        else:
+            starts = []
+            contains = []
+            for app in self.installed_apps:
+                if app.startswith(q):
+                    starts.append(app)
+                elif q in app:
+                    contains.append(app)
+            self.app_search_results = starts + contains
+        self.rcur = max(0, min(self.rcur, len(self.app_search_results) - 1))
+
+    def register_btn(self, name, row, start_x, text, action):
+        end_x = start_x + len(text)
+        self.buttons[name] = (row, start_x, end_x, action)
+
+    def switch_view(self, vid):
+        self.view = vid
+        if vid == self.TIMER and not self.timer_on:
+            self._start_timer()
+        self.rcur = 0
+        self.rscroll = 0
+        self.panel = self.RIGHT
+        self._alloc()
+        self.dirty = True
+
+    def _add_study(self, seconds):
+        """Accumulate study seconds into both the lifetime total and today's bucket."""
+        if seconds <= 0:
+            return
+        self.cfg.study_total += seconds
+        today = datetime.now().strftime("%Y-%m-%d")
+        if not isinstance(self.cfg.daily_study, dict):
+            self.cfg.daily_study = {}
+        self.cfg.daily_study[today] = self.cfg.daily_study.get(today, 0) + seconds
+
+    def _cleanup(self):
+        # Save study time before exit
+        self._add_study(self.study_session)
+        self.study_session = 0
+        self.cfg.save()
+        self.audio.shutdown()
+        self.blocker.stop()
+        if getattr(self, "cava", None):
+            self.cava.stop()
+
+    def run(self):
+        atexit.register(self._cleanup)
+        try:
+            curses.wrapper(self.curses_main)
+        except KeyboardInterrupt:
+            pass
+
+    def curses_main(self, stdscr):
+        self.stdscr = stdscr
+        curses.curs_set(0)
+        curses.use_default_colors()
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_BLUE, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_RED, -1)
+        curses.init_pair(5, curses.COLOR_CYAN, -1)
+        curses.init_pair(6, curses.COLOR_WHITE, -1)
+        curses.init_pair(7, curses.COLOR_MAGENTA, -1)
+
+        # Check if synthesized waves are ready
+        needs_synth = False
+        for f in ["white.wav", "pink.wav", "brown.wav", "storm.wav", "alpha.wav", "rain.wav"]:
+            if not os.path.exists(os.path.join(SOUNDS_DIR, f)):
+                needs_synth = True
+                break
+
+        # Setup screen runs while we synthesize noise WAVs and download recordings.
+        dl_missing = any(
+            not os.path.exists(os.path.join(SOUNDS_DIR, fn))
+            for _, (_, fn) in SOUND_DOWNLOADS.items()
+        ) or not os.path.exists(os.path.join(SOUNDS_DIR, "krishna_flute.mp3"))
+
+        if needs_synth or dl_missing:
+            self.view = self.SYNTH
+            self._alloc()
+
+            def cb(desc, pct):
+                self.synth_desc = desc
+                self.synth_pct = pct
+                self.dirty = True
+
+            def bootstrap():
+                if needs_synth:
+                    AudioSynthesizer.synthesize_all(cb)
+                download_sounds(cb)
+                cb("Ready!", 100)
+                self.dirty = True
+
+            threading.Thread(target=bootstrap, daemon=True).start()
+        else:
+            self._alloc()
+
+
+        stdscr.timeout(50)  # 20 FPS high response loop
+
+        while self.running_loop:
+            if self.view == self.SYNTH and self.synth_pct >= 100:
+                time.sleep(0.6)
+                self.view = self.HOME
+                self._alloc()
+
+            old_sec = self.timer_sec
+            self._tick()
+            if self.timer_sec != old_sec:
+                self.dirty = True
+
+            # Increment study stopwatch
+            now = time.time()
+            study_active = (self.timer_on and not self.timer_paused and not self.is_break) or self.stopwatch_on
+            if study_active:
+                if self.last_study_tick > 0:
+                    dt = now - self.last_study_tick
+                    if dt >= 1.0:
+                        elapsed = int(dt)
+                        self.study_session += elapsed
+                        self.last_study_tick = now - (dt - elapsed)
+                        self.dirty = True
+                else:
+                    self.last_study_tick = now
+            else:
+                self.last_study_tick = 0
+
+            if self.timer_on and not self.timer_paused:
+                self.spin_i = (self.spin_i + 1) % len(self.spin)
+                self.dirty = True
+
+            # Spectrum visualizer: advance bands, re-layout when it appears/hides.
+            if self.view != self.SYNTH:
+                self.vis.tick(self.audio.is_playing, self.audio.volume)
+                desired = self._vis_h()
+                if desired != self._vis_h_cur:
+                    self._alloc()
+                elif self._vis_h_cur > 0 and not self.vis.is_idle():
+                    self.dirty = True  # keep the bars animating
+
+            key = stdscr.getch()
+            if key in (curses.KEY_RESIZE, 410):
+                stdscr.clear()
+                self._alloc()
+                self.dirty = True
+            elif key != -1:
+                self.dirty = True
+                if not self._key(key):
+                    break
+
+            if self.dirty:
+                self._draw()
+                self.dirty = False
+
+    def _vis_h(self):
+        """Desired visualizer strip height (0 when off or audio is stopped)."""
+        if self.cfg.visualizer and self.audio.is_playing:
+            return max(1, min(4, self.cfg.visualizer_rows))
+        return 0
+
+    def _alloc(self):
+        my, mx = self.stdscr.getmaxyx()
+        self.lwin = None
+        self.rwin = None
+
+        self.hwin = None
+        if self.view == self.SYNTH:
+            self.rwin = curses.newwin(my, mx, 0, 0)
+            self._vis_h_cur = 0
+        else:
+            vis_h = self._vis_h()
+            # Leave room for the visualizer strip + footer below the panels.
+            self.left_w = max(24, min(mx // 2, self.left_w))
+            rw = max(20, mx - self.left_w)
+            ch = max(5, my - 2 - vis_h)
+            # Split the left column: todo on top, habits below. Habits is a core
+            # feature, so it stays visible down to small terminals — we only drop
+            # it when there isn't even room for two minimal cards (ch < 9). Habits
+            # is sized to show *all* of its content (2 borders + rows + button
+            # row), even when that crowds the todo list — the user wants every
+            # habit visible. Todo keeps a small floor (3 rows) and scrolls its own
+            # overflow; habits only falls back to its internal scroll when the
+            # terminal physically can't fit everything.
+            habits_h = 0
+            if ch >= 9:
+                n_habits = len(self.habits.habits)
+                want = max(5, n_habits + 4)  # borders + every habit row + button row
+                habits_h = min(want, ch - 3)  # leave todo at least 3 rows
+            todo_h = ch - habits_h
+            self.lwin = curses.newwin(todo_h, self.left_w, 1, 0)
+            if habits_h > 0:
+                self.hwin = curses.newwin(habits_h, self.left_w, 1 + todo_h, 0)
+            self.rwin = curses.newwin(ch, rw, 1, self.left_w)
+            self._todo_h = todo_h
+            self._vis_h_cur = vis_h
+            self._vis_row0 = 1 + ch  # strip sits just below the panels
+
+        self.stdscr.clear()
+        self.stdscr.refresh()
+        self.dirty = True
+
+    # ==========================================================================
+    # CARD DRAWING — ACTIVE PANEL BORDERS IN GREEN, INACTIVE IN DIM
+    # ==============================================================================
+    def _card(self, win, title="", cpair=5, active=True):
+        win.erase()
+        my, mx = win.getmaxyx()
+        ba = curses.color_pair(1) | curses.A_BOLD if active else curses.A_DIM
+
+        saddstr(win, 0, 0, "╭", ba)
+        saddstr(win, 0, mx - 1, "╮", ba)
+        saddstr(win, my - 1, 0, "╰", ba)
+        try:
+            win.addch(my - 1, mx - 1, ord("╯"), ba)
+        except curses.error:
+            pass
+        for x in range(1, mx - 1):
+            saddstr(win, 0, x, "─", ba)
+            saddstr(win, my - 1, x, "─", ba)
+        for y in range(1, my - 1):
+            saddstr(win, y, 0, "│", ba)
+            saddstr(win, y, mx - 1, "│", ba)
+        if title:
+            ta = curses.A_BOLD | curses.color_pair(cpair)
+            saddstr(win, 0, 2, f" {title} ", ta)
+
+    # ==========================================================================
+    # TIMER ENGINE
+    # ==========================================================================
+    def _tick(self):
+        if not self.timer_on or self.timer_paused:
+            return
+        now = time.time()
+        if self.last_tick_time == 0:
+            self.last_tick_time = now
+            return
+        dt = now - self.last_tick_time
+        if dt >= 1.0:
+            elapsed = int(dt)
+            self.timer_sec = max(0, self.timer_sec - elapsed)
+            self.last_tick_time = now - (dt - elapsed)
+            if self.timer_sec <= 0:
+                self._timer_done()
+
+    def _start_timer(self):
+        self.timer_on = True
+        self.timer_paused = False
+        self.last_tick_time = time.time()
+        self.blocker.set_break(self.is_break)
+        if self.is_break:
+            self.audio.one_shot("break")
+            self._notify("Break Started", "Take a moment to relax.")
+        else:
+            self.audio.one_shot("work")
+            self._notify("Focus Session Started", "Stay focused!")
+        self.dirty = True
+
+    def _timer_toggle(self):
+        """Pause/resume (or start) the focus timer — shared by key + mouse."""
+        if self.timer_paused or not self.timer_on:
+            self._start_timer()
+        else:
+            self._pause_timer()
+
+    def _timer_reset_home(self):
+        """Reset the timer and return to home — shared by key + mouse."""
+        self._reset_timer()
+        self.view = self.HOME
+        self._alloc()
+
+    def _pause_timer(self):
+        self.timer_paused = True
+        # Keep blocking while paused — pausing must not be a trivial bypass.
+        self.blocker.set_break(self.is_break)
+        self.dirty = True
+
+    def _reset_timer(self):
+        self.timer_on = False
+        self.timer_paused = False
+        self.is_break = False
+        self.timer_sec = self.cfg.work_dur * 60
+        self.total_sec = self.cfg.work_dur * 60
+        # No timer running → not a break → blocker stays active if enabled.
+        self.blocker.set_break(False)
+        self.dirty = True
+
+    def _timer_done(self):
+        # NOTE: do NOT stop ambient audio here — music plays continuously across
+        # focus/break boundaries by design. Only the transition chime fires.
+        # Save study progress
+        self._add_study(self.study_session)
+        self.study_session = 0
+        self.cfg.save()
+        if not self.is_break:
+            self.poms_done += 1
+            self.audio.one_shot("work")
+            self._notify("Focus Session Complete!", "Time for a relaxing break.")
+            if self.poms_done % self.cfg.sessions_before_long == 0:
+                self.is_break = True
+                self.timer_sec = self.cfg.long_break_dur * 60
+                self.total_sec = self.cfg.long_break_dur * 60
+            else:
+                self.is_break = True
+                self.timer_sec = self.cfg.short_break_dur * 60
+                self.total_sec = self.cfg.short_break_dur * 60
+            self.blocker.set_break(True)  # Allow apps during break
+            target = self.cfg.pomodoro_target
+            reached = target > 0 and self.poms_done >= target
+            if reached:
+                self._notify("All sessions complete! 🎉",
+                             f"You finished {self.poms_done} focus sessions.")
+            # Auto-start the break only if auto-start is on and we still have
+            # planned sessions left (0 target = unlimited).
+            if self.cfg.auto_start and not reached:
+                self._start_timer()
+            else:
+                self.timer_on = False
+        else:
+            self.audio.one_shot("break")
+            self._notify("Break Complete!", "Ready to focus?")
+            self.is_break = False
+            self.timer_sec = self.cfg.work_dur * 60
+            self.total_sec = self.cfg.work_dur * 60
+            self.blocker.set_break(False)  # Block apps during focus
+            target = self.cfg.pomodoro_target
+            reached = target > 0 and self.poms_done >= target
+            if self.cfg.auto_start and not reached:
+                self._start_timer()
+            else:
+                self.timer_on = False
+        self._alloc()
+        self.dirty = True
+
+    def _notify(self, title, msg):
+        if not self.cfg.notifications:
+            return
+        try:
+            subprocess.Popen(
+                ["notify-send", "-a", "flow", "-i", "alarm-clock", title, msg],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    # ==========================================================================
+    # INPUT MODE
+    # ==========================================================================
+    def _key_input(self, key):
+        if key in (10, 13):
+            self.input_mode = False
+            self._save_input(self.input_buf.strip())
+            self.input_buf = ""
+            self._alloc()
+        elif key == 27:
+            self.input_mode = False
+            self.input_buf = ""
+            self._alloc()
+        elif key in (127, 8, curses.KEY_BACKSPACE):
+            self.input_buf = self.input_buf[:-1]
+        elif 32 <= key < 127:
+            self.input_buf += chr(key)
+        self.dirty = True
+
+    def _save_input(self, val):
+        if not val:
+            return
+        if self.input_for == "add_task":
+            self.todo.add(val)
+        elif self.input_for == "add_sibling":
+            visible = get_visible_tasks(self.todo.tasks)
+            if visible and 0 <= self.lcur < len(visible):
+                item = visible[self.lcur]
+                self.todo.add_sibling_by_path(item["path"], val)
+            else:
+                self.todo.add(val)
+        elif self.input_for == "add_subtask":
+            visible = get_visible_tasks(self.todo.tasks)
+            if visible and 0 <= self.lcur < len(visible):
+                item = visible[self.lcur]
+                self.todo.add_subtask_by_path(item["path"], val)
+        elif self.input_for == "edit_task":
+            visible = get_visible_tasks(self.todo.tasks)
+            if visible and 0 <= self.lcur < len(visible):
+                node = self.todo._get_node_by_path(visible[self.lcur]["path"])
+                if node:
+                    node["summary"] = val
+                    self.todo.save()
+        elif self.input_for == "add_habit":
+            self.habits.add(val)
+            self.hcur = len(self.habits.habits) - 1
+        elif self.input_for == "edit_habit":
+            self.habits.rename(self.hcur, val)
+        elif self.input_for == "work_dur":
+            if val.isdigit() and int(val) > 0:
+                self.cfg.work_dur = int(val)
+                self.cfg.save()
+                if not self.timer_on:
+                    self.timer_sec = self.cfg.work_dur * 60
+                    self.total_sec = self.cfg.work_dur * 60
+        elif self.input_for == "short_dur":
+            if val.isdigit() and int(val) > 0:
+                self.cfg.short_break_dur = int(val)
+                self.cfg.save()
+        elif self.input_for == "long_dur":
+            if val.isdigit() and int(val) > 0:
+                self.cfg.long_break_dur = int(val)
+                self.cfg.save()
+        elif self.input_for == "vis_rows":
+            if val.isdigit():
+                self.cfg.visualizer_rows = max(1, min(4, int(val)))
+                self.cfg.save()
+                self._alloc()
+        elif self.input_for == "vis_bars":
+            if val.isdigit():
+                self.cfg.vis_bars = max(20, min(100, int(val)))
+                self.cfg.save()
+                if getattr(self, "cava", None):  # restart cava with new bar count
+                    self.cava.stop()
+                    self.cava = CavaEngine(bars=self.cfg.vis_bars)
+                    self.cava_on = self.cava.start()
+        elif self.input_for == "vis_amp":
+            if val.isdigit():
+                self.cfg.vis_amplitude = max(25, min(150, int(val)))
+                self.cfg.save()
+        elif self.input_for == "daily_goal":
+            secs = parse_duration_to_seconds(val)
+            if secs > 0:
+                self.cfg.daily_goal_seconds = secs
+                self.cfg.save()
+        elif self.input_for == "session_target":
+            if val.isdigit():
+                self.cfg.pomodoro_target = max(0, min(99, int(val)))
+                self.cfg.save()
+        elif self.input_for == "countdown_name":
+            self.cfg.countdown_name = val[:24]
+            self.cfg.save()
+        elif self.input_for == "countdown_date":
+            try:
+                iso = self._parse_date(val)
+            except ValueError as e:
+                self._flash(f"Invalid date — {e}")
+            else:
+                if not iso:
+                    self.cfg.countdown_date = ""
+                    self.cfg.save()
+                    self._flash("Countdown cleared")
+                elif datetime.strptime(iso, "%Y-%m-%d").date() < datetime.now().date():
+                    self._flash("Invalid date — that day already passed")
+                else:
+                    self.cfg.countdown_date = iso
+                    self.cfg.save()
+                    self._flash(f"Countdown set → {iso}")
+        elif self.input_for == "export_path":
+            self._export_stats(val)
+
+        self.dirty = True
+
+    def _begin_input(self, target):
+        self.input_mode = True
+        self.input_buf = ""
+        self.input_for = target
+        self.dirty = True
+
+    # Per-input format hints, shown dimmed beside the prompt so the user knows
+    # exactly what to type. Keys match self.input_for values.
+    _INPUT_HINTS = {
+        "work_dur": "format: minutes (e.g. 25)",
+        "short_dur": "format: minutes (e.g. 5)",
+        "long_dur": "format: minutes (e.g. 15)",
+        "daily_goal": "format: 2h 30m / 90m / 1h",
+        "session_target": "format: 0–99 (0 = unlimited)",
+        "countdown_name": "format: text (max 24 chars)",
+        "countdown_date": "format: DD/MM/YYYY (e.g. 30/08/2026)",
+        "vis_rows": "format: 1–4",
+        "vis_bars": "format: 20–100",
+        "vis_amp": "format: 25–150 (percent)",
+        "export_path": "format: folder path (e.g. ~/Desktop) · blank = cancel",
+    }
+
+    def _input_hint(self, target):
+        return self._INPUT_HINTS.get(target, "")
+
+    # ==========================================================================
+    # KEY ROUTING
+    # ==========================================================================
+    def _mouse_habits(self, my, mx, is_click):
+        """Hover/click inside the habits sub-window (origin row 1+_todo_h).
+        Hover moves the cursor; only a real click toggles or hits a button."""
+        if not self.hwin:
+            return
+        hwin_h = self.hwin.getmaxyx()[0]
+        w_y = my - (1 + self._todo_h)  # window-relative row
+        w_x = mx
+        items = self.habits.habits
+        n = len(items)
+        # Bottom helper buttons row (click only).
+        if is_click and w_y == hwin_h - 2:
+            add_txt = " [+ habit] "
+            del_txt = " [✕ del] "
+            if 2 <= w_x < 2 + len(add_txt):
+                self._begin_input("add_habit")
+                return
+            if 2 + len(add_txt) + 1 <= w_x < 2 + len(add_txt) + 1 + len(del_txt):
+                if 0 <= self.hcur < n:
+                    self.habits.delete(self.hcur)
+                    self.hcur = max(0, min(self.hcur, len(self.habits.habits) - 1))
+                return
+        # Item rows start at window row 1. Hover selects; click toggles today.
+        idx = self.hscroll + (w_y - 1)
+        if 0 <= idx < n:
+            self.hcur = idx
+            if is_click:
+                self.habits.toggle_today(idx)
+
+    def _handle_mouse(self, my, mx, bstate):
+        # Classify the event: scroll wheel, a real button press/click, or just a
+        # motion/hover report (REPORT_MOUSE_POSITION). Hover moves focus only;
+        # presses trigger actions. This keeps the UI mouse-first without letting
+        # a scroll or a mouse-move accidentally fire an action (e.g. a habit).
+        is_scroll_up = bool(bstate & curses.BUTTON4_PRESSED)
+        is_scroll_down = bool(bstate & (getattr(curses, "BUTTON5_PRESSED", 0) or 0x200000))
+        is_motion = bool(bstate & getattr(curses, "REPORT_MOUSE_POSITION", 0))
+        is_click = not is_motion and not is_scroll_up and not is_scroll_down
+
+        # Generic registered-button hit test (absolute coords) — click only, so a
+        # hover over a tab/quit button never triggers it.
+        if is_click:
+            for name, (row, start_x, end_x, action) in self.buttons.items():
+                if my == row and start_x <= mx < end_x:
+                    action()
+                    self.dirty = True
+                    return
+
+        std_my, std_mx = self.stdscr.getmaxyx()
+
+        if 1 <= my < std_my - 1:
+            if 0 <= mx < self.left_w:
+                self.dirty = True
+                todo_h = getattr(self, "_todo_h", std_my - 2)
+
+                # Pointer landed in the habits sub-window (below the todo window).
+                if self.hwin is not None and my >= 1 + todo_h:
+                    self.panel = self.LEFT
+                    self.left_section = self.SEC_HABITS
+                    n = len(self.habits.habits)
+                    if is_scroll_up:
+                        self.hcur = max(0, self.hcur - 1)
+                        return
+                    if is_scroll_down:
+                        self.hcur = min(n - 1, self.hcur + 1) if n else 0
+                        return
+                    self._mouse_habits(my, mx, is_click)
+                    return
+
+                self.panel = self.LEFT
+                self.left_section = self.SEC_TODO
+                w_y = my - 1
+                w_x = mx
+
+                visible = get_visible_tasks(self.todo.tasks)
+                n = len(visible)
+                lwin_h = todo_h
+
+                if is_scroll_up:
+                    if self.lcur > 0:
+                        self.lcur -= 1
+                    return
+                elif is_scroll_down:
+                    if self.lcur < n - 1:
+                        self.lcur += 1
+                    return
+
+                # Button [+ task] [+ subtask] [✎ edit] [✕ delete] — click only.
+                if is_click and w_y == lwin_h - 2:
+                    add_sib_len = len(" [+ task] ")
+                    add_sub_len = len(" [+ subtask] ")
+                    edit_len = len(" [✎ edit] ")
+                    del_len = len(" [✕ delete] ")
+                    c = 2
+                    if c <= w_x < c + add_sib_len:
+                        self._begin_input("add_sibling")
+                        return
+                    c += add_sib_len + 1
+                    if c <= w_x < c + add_sub_len:
+                        self._begin_input("add_subtask")
+                        return
+                    c += add_sub_len + 1
+                    if c <= w_x < c + edit_len:
+                        if visible and 0 <= self.lcur < n:
+                            item = visible[self.lcur]
+                            self.input_mode = True
+                            self.input_buf = item["task"]["summary"]
+                            self.input_for = "edit_task"
+                            self.dirty = True
+                        return
+                    c += edit_len + 1
+                    if c <= w_x < c + del_len:
+                        if visible and 0 <= self.lcur < n:
+                            item = visible[self.lcur]
+                            self.todo.delete_by_path(item["path"])
+                            self.lcur = max(0, min(self.lcur, len(get_visible_tasks(self.todo.tasks)) - 1))
+                        return
+
+                # Hover/click a list row — select only (toggle is space/click-check elsewhere).
+                hovered_idx = self.lscroll + (w_y - 1)
+                if 0 <= hovered_idx < n:
+                    self.lcur = hovered_idx
+
+            elif self.left_w <= mx < std_mx:
+                self.panel = self.RIGHT
+                self.dirty = True
+                w_y = my - 1
+                w_x = mx - self.left_w
+                rw = std_mx - self.left_w
+
+                # HOME and TIMER buttons are handled by the generic register_btn
+                # hit-test at the top of this method (mouse-first, no stale geometry).
+                if self.view == self.SOUNDS:
+                    if is_scroll_up:
+                        if self.rcur > 0:
+                            self.rcur -= 1
+                        return
+                    elif is_scroll_down:
+                        if self.rcur < len(self.audio.sounds) - 1:
+                            self.rcur += 1
+                        return
+                    hovered_idx = w_y - 2
+                    if 0 <= hovered_idx < len(self.audio.sounds):
+                        self.rcur = hovered_idx
+                        if is_click:
+                            self.audio.toggle_sound(hovered_idx)
+                        return
+                    vy = len(self.audio.sounds) + 3
+                    # Bigger, forgiving volume hitboxes: the whole [ - ]/[ + ]
+                    # cells plus the bar react; ±/bar work on hover-drag too.
+                    if is_click and vy - 1 <= w_y <= vy + 1:
+                        bw = max(6, min(20, rw - 30))
+                        bar_start = 15
+                        bar_end = bar_start + bw
+                        if 3 <= w_x < 14:            # "vol  [ - ]" zone
+                            self.audio.set_volume(self.audio.volume - 5)
+                        elif bar_end <= w_x < bar_end + 8:   # "[ + ]" zone
+                            self.audio.set_volume(self.audio.volume + 5)
+                        elif bar_start <= w_x < bar_end:
+                            vol = int((w_x - bar_start) / max(1, bw) * 100)
+                            self.audio.set_volume(vol)
+                    return
+
+                elif self.view == self.SETTINGS:
+                    n = getattr(self, "_settings_n", 12)
+                    if is_scroll_up:
+                        self._settings_move(-1)
+                        return
+                    elif is_scroll_down:
+                        self._settings_move(1)
+                        return
+                    hovered_idx = self.rscroll + (w_y - 2)
+                    if 0 <= hovered_idx < n and self._settings_selectable(hovered_idx):
+                        self.rcur = hovered_idx
+                        if is_click:
+                            self._settings_action(hovered_idx)
+                    return
+
+                elif self.view == self.APPS:
+                    items = self.cfg.blocked_apps
+                    n = len(items)
+                    if is_scroll_up:
+                        if self.rcur > 0:
+                            self.rcur -= 1
+                        return
+                    elif is_scroll_down:
+                        if self.rcur < n - 1:
+                            self.rcur += 1
+                        return
+                    hovered_idx = self.rscroll + (w_y - 2)
+                    if 0 <= hovered_idx < n:
+                        self.rcur = hovered_idx
+                        return
+                    rwin_h = std_my - 2
+                    if is_click and w_y == rwin_h - 2:
+                        btn_add = " [+ add] "
+                        btn_del = " [✕ delete] "
+                        if 3 <= w_x < 3 + len(btn_add):
+                            self.view = self.APPS_SEARCH
+                            self.app_search_q = ""
+                            self.update_app_search()
+                            self._alloc()
+                        elif 3 + len(btn_add) + 2 <= w_x < 3 + len(btn_add) + 2 + len(btn_del):
+                            if 0 <= self.rcur < n:
+                                items.pop(self.rcur)
+                                self.cfg.save()
+                                self.rcur = max(0, min(self.rcur, len(items) - 1))
+                    return
+
+                elif self.view == self.APPS_SEARCH:
+                    n = len(self.app_search_results)
+                    if is_scroll_up:
+                        if self.rcur > 0:
+                            self.rcur -= 1
+                        return
+                    elif is_scroll_down:
+                        if self.rcur < n - 1:
+                            self.rcur += 1
+                        return
+                    hovered_idx = w_y - 4
+                    if 0 <= hovered_idx < n:
+                        self.rcur = hovered_idx
+                        if is_click:
+                            app = self.app_search_results[hovered_idx]
+                            if app != "loading apps..." and app not in self.cfg.blocked_apps:
+                                self.cfg.blocked_apps.append(app)
+                                self.cfg.save()
+                            self.view = self.APPS
+                            self.rcur = 0
+                            self._alloc()
+                    return
+
+    def _key(self, key):
+        if key == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                if self.show_help:
+                    self.show_help = False  # any click dismisses help
+                    self.dirty = True
+                else:
+                    self._handle_mouse(my, mx, bstate)
+            except curses.error:
+                pass
+            return True
+
+        # Help overlay swallows the next keypress to dismiss itself.
+        if self.show_help:
+            self.show_help = False
+            self.dirty = True
+            return True
+
+        if self.input_mode:
+            self._key_input(key)
+            return True
+
+        # Toggle help overlay (not while typing into an input/search field).
+        if key == ord("?") and self.view != self.APPS_SEARCH:
+            self.show_help = True
+            self.dirty = True
+            return True
+
+        if self.view == self.APPS_SEARCH:
+            if key == 27:
+                self.view = self.APPS
+                self.rcur = 0
+                self._alloc()
+            elif key in (10, 13):
+                if 0 <= self.rcur < len(self.app_search_results):
+                    app = self.app_search_results[self.rcur]
+                    if app != "loading apps..." and app not in self.cfg.blocked_apps:
+                        self.cfg.blocked_apps.append(app)
+                        self.cfg.save()
+                    self.view = self.APPS
+                    self.rcur = 0
+                    self._alloc()
+            elif key == curses.KEY_UP:
+                if self.rcur > 0:
+                    self.rcur -= 1
+            elif key == curses.KEY_DOWN:
+                if self.rcur < len(self.app_search_results) - 1:
+                    self.rcur += 1
+            elif key in (127, 8, curses.KEY_BACKSPACE):
+                self.app_search_q = self.app_search_q[:-1]
+                self.update_app_search()
+            elif 32 <= key < 127:
+                self.app_search_q += chr(key)
+                self.update_app_search()
+            return True
+
+        # ── Global keys ──
+        if key == 9:  # Tab — cycle: todo → habits → right panel → todo
+            if self.panel == self.RIGHT:
+                self.panel = self.LEFT
+                self.left_section = self.SEC_TODO
+            elif self.left_section == self.SEC_TODO and self.hwin is not None:
+                self.left_section = self.SEC_HABITS
+            else:
+                self.panel = self.RIGHT
+            return True
+
+        if key == 27:  # Esc
+            if self.view == self.APPS:
+                self.view = self.SETTINGS
+                self.rcur = 0
+            elif self.view != self.HOME:
+                self.view = self.HOME
+                self.rcur = 0
+            self._alloc()
+            return True
+
+        if key == ord("q") and self.panel == self.RIGHT:
+            self.running_loop = False
+            return False
+
+        # Mute/unmute — global
+        if key == ord("m") and self.panel == self.RIGHT and self.view not in (self.APPS_SEARCH,):
+            self.audio.toggle()
+            return True
+
+        # Volume controls — global
+        if key in (ord("+"), ord("=")):
+            self.audio.set_volume(self.audio.volume + 5)
+            return True
+        if key == ord("-"):
+            self.audio.set_volume(self.audio.volume - 5)
+            return True
+
+        # Toggle bottom spectrum visualizer — global
+        if key == ord("v"):
+            self.cfg.visualizer = not self.cfg.visualizer
+            self.cfg.save()
+            self._alloc()
+            return True
+
+        # Quick view navigation — global (works from either panel; the input and
+        # APPS_SEARCH guards above already prevent these from firing while typing).
+        if key == ord("h"):
+            self.switch_view(self.HOME)
+            return True
+        if key == ord("o"):  # 'o' for music / ambient sounds
+            self.switch_view(self.SOUNDS)
+            return True
+        if key == ord("t"):
+            self.switch_view(self.STATS)
+            return True
+
+        # Stopwatch toggle with space (primary feature) — from HOME view, RIGHT panel
+        if key == ord(" ") and self.panel == self.RIGHT and self.view == self.HOME:
+            self.stopwatch_on = not self.stopwatch_on
+            if self.stopwatch_on:
+                self.last_study_tick = time.time()
+            return True
+
+        # Stopwatch reset with r — from HOME view, RIGHT panel
+        if key == ord("r") and self.panel == self.RIGHT and self.view == self.HOME:
+            self.stopwatch_on = False
+            # Bank whatever was accrued (keeps daily stats), then zero the live total.
+            self._add_study(self.study_session)
+            self.study_session = 0
+            self.cfg.study_total = 0
+            self.cfg.save()
+            return True
+
+        # View switching (only from right panel & non-input views)
+        if self.panel == self.RIGHT and self.view in (self.HOME, self.TIMER, self.SOUNDS, self.STATS, self.SETTINGS):
+            if key == ord("f"):
+                self.switch_view(self.TIMER)
+                return True
+            if key == ord("s"):
+                self.switch_view(self.SETTINGS)
+                return True
+
+        # Panel width adjustment
+        if key == ord("["):
+            self.left_w = max(24, self.left_w - 2)
+            self.cfg.left_panel_width = self.left_w
+            self.cfg.save()
+            self._alloc()
+            return True
+        if key == ord("]"):
+            _, smx = self.stdscr.getmaxyx()
+            self.left_w = min(smx // 2, self.left_w + 2)
+            self.cfg.left_panel_width = self.left_w
+            self.cfg.save()
+            self._alloc()
+            return True
+
+        # Panel-specific keys
+        if self.panel == self.LEFT:
+            if self.left_section == self.SEC_HABITS and self.hwin is not None:
+                self._key_habits(key)
+            else:
+                self._key_todo(key)
+        else:
+            self._key_right(key)
+
+        return True
+
+    def _key_todo(self, key):
+        visible = get_visible_tasks(self.todo.tasks)
+        n = len(visible)
+        if not visible:
+            if key == ord("a"):
+                self._begin_input("add_task")
+            return
+
+        if key == curses.KEY_UP:
+            if self.lcur > 0:
+                self.lcur -= 1
+        elif key == curses.KEY_DOWN:
+            if self.lcur < n - 1:
+                self.lcur += 1
+        elif key in (ord(" "), 10, 13):
+            item = visible[self.lcur]
+            self.todo.toggle_by_path(item["path"])
+        elif key == ord("a"):
+            self._begin_input("add_sibling")
+        elif key == ord("s"):
+            self._begin_input("add_subtask")
+        elif key == ord("e"):
+            item = visible[self.lcur]
+            self.input_mode = True
+            self.input_buf = item["task"]["summary"]
+            self.input_for = "edit_task"
+            self.dirty = True
+        elif key == ord("d"):
+            item = visible[self.lcur]
+            self.todo.delete_by_path(item["path"])
+            self.lcur = max(0, min(self.lcur, len(get_visible_tasks(self.todo.tasks)) - 1))
+        elif key == curses.KEY_LEFT:
+            item = visible[self.lcur]["task"]
+            if item.get("subtasks"):
+                item["expanded"] = False
+                self.todo.save()
+        elif key == curses.KEY_RIGHT:
+            item = visible[self.lcur]["task"]
+            if item.get("subtasks"):
+                item["expanded"] = True
+                self.todo.save()
+
+    def _key_habits(self, key):
+        n = len(self.habits.habits)
+        if key == ord("a"):
+            self._begin_input("add_habit")
+            return
+        if n == 0:
+            return
+        self.hcur = max(0, min(self.hcur, n - 1))
+        if key == curses.KEY_UP:
+            if self.hcur > 0:
+                self.hcur -= 1
+        elif key == curses.KEY_DOWN:
+            if self.hcur < n - 1:
+                self.hcur += 1
+        elif key in (ord(" "), 10, 13):
+            self.habits.toggle_today(self.hcur)
+        elif key == ord("e"):
+            self.input_mode = True
+            self.input_buf = self.habits.habits[self.hcur]["name"]
+            self.input_for = "edit_habit"
+            self.dirty = True
+        elif key == ord("d"):
+            self.habits.delete(self.hcur)
+            self.hcur = max(0, min(self.hcur, len(self.habits.habits) - 1))
+
+    def _key_right(self, key):
+        if self.view == self.SOUNDS:
+            n = len(self.audio.sounds)
+            if key == curses.KEY_UP:
+                if self.rcur > 0:
+                    self.rcur -= 1
+            elif key == curses.KEY_DOWN:
+                if self.rcur < n - 1:
+                    self.rcur += 1
+            elif key in (10, 13):
+                self.audio.play(self.rcur)
+
+        elif self.view == self.SETTINGS:
+            if key == curses.KEY_UP:
+                self._settings_move(-1)
+            elif key == curses.KEY_DOWN:
+                self._settings_move(1)
+            elif key in (10, 13):
+                self._settings_action(self.rcur)
+
+        elif self.view == self.APPS:
+            n = len(self.cfg.blocked_apps)
+            if key == curses.KEY_UP:
+                if self.rcur > 0:
+                    self.rcur -= 1
+            elif key == curses.KEY_DOWN:
+                if self.rcur < n - 1:
+                    self.rcur += 1
+            elif key == ord("a"):
+                self.view = self.APPS_SEARCH
+                self.app_search_q = ""
+                self.update_app_search()
+                self._alloc()
+            elif key == ord("d"):
+                if 0 <= self.rcur < n:
+                    self.cfg.blocked_apps.pop(self.rcur)
+                    self.cfg.save()
+                    self.rcur = max(0, min(self.rcur, len(self.cfg.blocked_apps) - 1))
+        
+        elif self.view == self.STATS:
+            if key in (ord("1"), ord("2"), ord("3"), ord("4")):
+                self._set_stats_mode(key - ord("1"))
+            elif key == curses.KEY_LEFT:
+                if self.stats_mode == 2:
+                    self._cal_nav(1)   # older month
+                else:
+                    self._set_stats_mode(max(0, self.stats_mode - 1))
+            elif key == curses.KEY_RIGHT:
+                if self.stats_mode == 2:
+                    self._cal_nav(-1)  # newer month
+                else:
+                    self._set_stats_mode(min(3, self.stats_mode + 1))
+
+        elif self.view == self.TIMER:
+            if key == ord(" "):
+                if self.timer_paused or not self.timer_on:
+                    self._start_timer()
+                else:
+                    self._pause_timer()
+            elif key == ord("r"):
+                self._reset_timer()
+                self.view = self.HOME
+                self._alloc()
+
+    # ==========================================================================
+    # RENDER
+    # ==========================================================================
+    def _draw(self):
+        my, mx = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+
+        # ── Top bar with clickable tabs ──
+        if self.cfg.clock_24h:
+            clock = datetime.now().strftime("%H:%M")
+        else:
+            clock = datetime.now().strftime("%I:%M %p").lstrip("0")
+            
+        self.buttons.clear()
+        saddstr(self.stdscr, 0, 1, " ◉ flow ", curses.A_BOLD | curses.color_pair(5))
+        
+        # Tabs navigation
+        tx = 10
+        tabs = [
+            ("home", " ⌂ home ", self.HOME),
+            ("focus", " ⏰ focus ", self.TIMER),
+            ("sounds", " 🎵 sounds ", self.SOUNDS),
+            ("stats", " 📊 stats ", self.STATS),
+            ("settings", " ⚙ settings ", self.SETTINGS),
+        ]
+        for name, label, view_id in tabs:
+            style = curses.color_pair(1) | curses.A_REVERSE if self.view == view_id else curses.A_NORMAL
+            btn_text = f"[{label}]"
+            saddstr(self.stdscr, 0, tx, btn_text, style)
+            self.register_btn(f"tab_{name}", 0, tx, btn_text, lambda vid=view_id: self.switch_view(vid))
+            tx += len(btn_text) + 1
+
+        # Clickable help button
+        help_text = "[ ? ]"
+        saddstr(self.stdscr, 0, tx, help_text, curses.color_pair(3))
+        self.register_btn("tab_help", 0, tx, help_text,
+                          lambda: setattr(self, "show_help", True))
+        tx += len(help_text) + 1
+
+        # Draw Quit button
+        q_text = "[ ✕ quit ]"
+        qx = mx - len(clock) - len(q_text) - 4
+        saddstr(self.stdscr, 0, qx, q_text, curses.color_pair(4))
+        self.register_btn("tab_quit", 0, qx, q_text, lambda: setattr(self, 'running_loop', False))
+
+        saddstr(self.stdscr, 0, mx - len(clock) - 2, clock, curses.A_DIM)
+
+        # Top-bar focus indicator: today's progress toward the daily goal, in
+        # flow-green — mirrors the first line of the Stats ▸ Daily view
+        # ("today 18m · 15% of goal"). ●/○ shows whether the stopwatch is live.
+        today_secs = self._study_for(datetime.now().strftime("%Y-%m-%d"))
+        goal = max(1, self.cfg.daily_goal_seconds)
+        pct = int(today_secs / goal * 100)
+        dot = "● " if self.stopwatch_on else "○ "
+        full = f"{dot}today {self._fmt_hm(today_secs)} · {pct}% of goal"
+        short = f"{dot}{self._fmt_hm(today_secs)} · {pct}%"
+        sw_label = full if (qx - len(full) - 3) > tx else short
+        sw_x = qx - len(sw_label) - 3
+        sw_attr = curses.color_pair(1) | curses.A_BOLD  # flow green
+        if sw_x > tx:
+            saddstr(self.stdscr, 0, sw_x, sw_label, sw_attr)
+
+        # Countdown to a named date, left of the stopwatch (always visible).
+        cd = self._countdown_label()
+        if cd:
+            cd_text, cd_attr = cd
+            cd_x = sw_x - len(cd_text) - 2
+            if cd_x > tx:  # only if it won't collide with the tabs
+                saddstr(self.stdscr, 0, cd_x, cd_text, cd_attr)
+
+        # ── Footer ──
+        flash = self._active_flash()
+        if self.input_mode:
+            label = self.input_for.replace("_", " ")
+            prompt = f" ✎ {label}: {self.input_buf}█ "
+            saddstr(self.stdscr, my - 1, 1, prompt, curses.A_BOLD | curses.color_pair(3))
+            hint = self._input_hint(self.input_for)
+            tail = (f"{hint}  ·  Enter confirm · Esc cancel" if hint
+                    else "Enter confirm · Esc cancel")
+            saddstr(self.stdscr, my - 1, len(prompt) + 2, tail, curses.A_DIM)
+        elif flash:
+            saddstr(self.stdscr, my - 1, 1, " " + flash + " ", curses.color_pair(1) | curses.A_BOLD)
+        else:
+            saddstr(self.stdscr, my - 1, 1, self._footer(), curses.A_DIM)
+
+        self._draw_visualizer(my, mx)
+
+        self.stdscr.noutrefresh()
+
+        if self.view == self.SYNTH:
+            self._draw_synth()
+        else:
+            self._draw_todo()
+            self._draw_habits()
+            self._draw_right()
+
+        if self.show_help:
+            self._draw_help(my, mx)
+            # Flush the overlay LAST so it sits on top of the panel windows —
+            # without this re-noutrefresh the help box never reaches the screen
+            # and flickers (the panels were noutrefresh'd after the base stdscr).
+            self.stdscr.noutrefresh()
+
+        curses.doupdate()
+
+    def _draw_help(self, my, mx):
+        """Modal cheat-sheet overlay — dismissed by any key or click. Every line
+        is laid out and clipped relative to the box so nothing spills past it."""
+        lines = [
+            ("Navigation", ""),
+            ("Tab", "switch panel focus"),
+            ("h / o / t", "home / sounds / stats"),
+            ("f / s", "focus timer / settings"),
+            ("click / hover", "tabs click; focus follows mouse"),
+            ("[  ]", "shrink / grow left column"),
+            ("Esc / q", "back to home / quit"),
+            ("Todo (left, top)", ""),
+            ("a / s", "add task / subtask"),
+            ("e / d", "edit / delete"),
+            ("space / click", "toggle done"),
+            ("← / →", "fold / unfold"),
+            ("Habits (left, bottom)", ""),
+            ("a / e / d", "add / edit / delete"),
+            ("space / click", "check today"),
+            ("Stats (top bar)", ""),
+            ("1 / 2 / 3 / 4", "daily / habits / month / year"),
+            ("← / →", "switch view or month"),
+            ("Focus timer", ""),
+            ("f", "open focus timer"),
+            ("space / click", "pause / resume"),
+            ("r / click", "reset"),
+            ("Sounds & audio", ""),
+            ("click a sound", "add / remove from mix"),
+            ("m", "mute / unmute"),
+            ("+ / -", "volume up / down"),
+            ("v", "toggle visualizer"),
+            ("mouse-first", "click any [button] or row"),
+        ]
+        bw = max(34, min(mx - 4, 60))
+        bh = min(my - 2, len(lines) + 4)
+        if bh < 5:
+            return
+        x0 = (mx - bw) // 2
+        y0 = (my - bh) // 2
+        inner_x = x0 + 2
+        inner_w = bw - 4          # printable width inside the borders
+        key_w = min(16, inner_w // 2)
+        # Box background + borders
+        for yy in range(y0, y0 + bh):
+            saddstr(self.stdscr, yy, x0, " " * bw, curses.A_NORMAL)
+        saddstr(self.stdscr, y0, x0, "╭" + "─" * (bw - 2) + "╮", curses.color_pair(5) | curses.A_BOLD)
+        saddstr(self.stdscr, y0 + bh - 1, x0, "╰" + "─" * (bw - 2) + "╯", curses.color_pair(5) | curses.A_BOLD)
+        for yy in range(y0 + 1, y0 + bh - 1):
+            saddstr(self.stdscr, yy, x0, "│", curses.color_pair(5) | curses.A_BOLD)
+            saddstr(self.stdscr, yy, x0 + bw - 1, "│", curses.color_pair(5) | curses.A_BOLD)
+        saddstr(self.stdscr, y0, x0 + 2, " keybinds & tips ", curses.color_pair(3) | curses.A_BOLD)
+        row = y0 + 2
+        for k, desc in lines:
+            if row >= y0 + bh - 1:
+                break
+            if not desc:  # section header — clipped to inner width
+                saddstr(self.stdscr, row, inner_x, k[:inner_w], curses.color_pair(1) | curses.A_BOLD)
+            else:
+                saddstr(self.stdscr, row, inner_x, k[:key_w], curses.A_BOLD | curses.color_pair(6))
+                dx = inner_x + key_w + 1
+                dmax = max(0, x0 + bw - 2 - dx)   # clip so desc never crosses the border
+                saddstr(self.stdscr, row, dx, desc[:dmax], curses.A_DIM)
+            row += 1
+        if row < y0 + bh - 1:
+            saddstr(self.stdscr, y0 + bh - 1, x0 + 2, " press any key to close ",
+                    curses.color_pair(5))
+
+    def _draw_visualizer(self, my, mx):
+        """Render the bottom spectrum strip (one colour per row, cliamp-style)."""
+        vis_h = self._vis_h_cur
+        if vis_h <= 0 or self.view == self.SYNTH:
+            return
+        amp = max(0.25, min(1.5, self.cfg.vis_amplitude / 100.0))
+        if getattr(self, "cava_on", False) and self.cava.has_signal():
+            levels = [min(1.0, v * amp) for v in self.cava.columns(mx)]
+        else:
+            levels = [min(1.0, v * amp) for v in self.vis.columns(mx)]
+        if not levels:
+            return
+        for r in range(vis_h):
+            row = self._vis_row0 + r
+            if row >= my - 1:  # never overwrite the footer
+                break
+            row_bottom = (vis_h - 1 - r) / vis_h
+            row_top = (vis_h - r) / vis_h
+            span = row_top - row_bottom
+            chars = []
+            for lv in levels:
+                if lv >= row_top:
+                    chars.append("█")
+                elif lv > row_bottom and span > 0:
+                    frac = (lv - row_bottom) / span
+                    idx = max(0, min(8, int(frac * 8)))
+                    chars.append(self.vis.BLOCKS[idx])
+                else:
+                    chars.append(" ")
+            # Colour tier by the row's base height: top rows hot, bottom cool.
+            if row_bottom >= 0.6:
+                attr = curses.color_pair(3)   # high — yellow
+            elif row_bottom >= 0.3:
+                attr = curses.color_pair(1)   # mid — green
+            else:
+                attr = curses.color_pair(5)   # low — cyan
+            saddstr(self.stdscr, row, 0, "".join(chars), attr)
+
+    def _countdown_label(self):
+        """(text, attr) for the top-bar countdown, or None if disabled/invalid."""
+        ds = getattr(self.cfg, "countdown_date", "") or ""
+        if not ds:
+            return None
+        try:
+            target = datetime.strptime(ds, "%Y-%m-%d").date()
+        except Exception:
+            return None
+        days = (target - datetime.now().date()).days
+        name = (self.cfg.countdown_name or "countdown").strip()
+        if days > 0:
+            text = f"⏳ {name}: {days}d"
+            attr = curses.color_pair(3) | curses.A_BOLD
+        elif days == 0:
+            text = f"⏳ {name}: today!"
+            attr = curses.color_pair(1) | curses.A_BOLD
+        else:
+            text = f"⏳ {name}: passed"
+            attr = curses.A_DIM
+        return text, attr
+
+    def _active_flash(self):
+        """Return a transient footer message if one was set in the last 4s."""
+        msg = getattr(self, "_flash_msg", "")
+        if msg and (time.time() - getattr(self, "_flash_t", 0)) < 4.0:
+            return msg
+        return ""
+
+    def _footer(self):
+        p = ["Tab:switch"]
+        if self.panel == self.LEFT and self.left_section == self.SEC_HABITS:
+            p += ["a:add habit", "e:edit", "d:delete", "spc:check today", "[ ]:width"]
+        elif self.panel == self.LEFT:
+            p += ["a:add", "s:subtask", "e:edit", "d:delete", "spc:toggle", "←/→:fold", "[ ]:width"]
+        else:
+            if self.view == self.HOME:
+                sw = "spc:start" if not self.stopwatch_on else "spc:stop"
+                p += [sw, "r:reset", "h/o/t/f/s:views", "m:mute", "v:viz", "[ ]:width"]
+            elif self.view == self.TIMER:
+                pk = "spc:resume" if self.timer_paused else "spc:pause"
+                p += [pk, "r:reset", "m:mute", "+/-:vol", "v:viz", "Esc:back"]
+            elif self.view == self.SOUNDS:
+                p += ["↑/↓:select", "Enter:play", "m:mute", "+/-:vol", "v:viz", "Esc:back"]
+            elif self.view == self.STATS:
+                p += ["1/2/3/4:view", "←/→:switch/month", "Esc:back"]
+            elif self.view == self.SETTINGS:
+                p += ["↑/↓:select", "Enter:toggle/edit", "Esc:back"]
+            elif self.view == self.APPS:
+                p += ["↑/↓:select", "a:add", "d:delete", "Esc:back"]
+            elif self.view == self.APPS_SEARCH:
+                p += ["type to search", "↑/↓:navigate", "Enter:select", "Esc:cancel"]
+        p += ["?:help"]
+        return " " + " │ ".join(p) + " "
+
+    # ==========================================================================
+    # SYNTHESIS SCREEN
+    # ==========================================================================
+    def _draw_synth(self):
+        w = self.rwin
+        w.erase()
+        my, mx = w.getmaxyx()
+        saddstr(w, my // 2 - 3, max(1, (mx - 22) // 2), "Audio Initialization",
+                curses.A_BOLD | curses.color_pair(5))
+        saddstr(w, my // 2 - 1, max(1, (mx - len(self.synth_desc)) // 2),
+                self.synth_desc, curses.A_DIM)
+        bw = min(30, mx - 8)
+        filled = int(self.synth_pct / 100 * bw)
+        bar = "━" * filled + "─" * (bw - filled)
+        saddstr(w, my // 2 + 1, max(1, (mx - bw - 6) // 2), bar,
+                curses.A_BOLD | curses.color_pair(1))
+        saddstr(w, my // 2 + 1, max(1, (mx - bw - 6) // 2) + bw + 1,
+                f"{self.synth_pct}%", curses.A_DIM)
+        w.noutrefresh()
+
+    # ==========================================================================
+    # TODO PANEL (LEFT) — SUBTASK NESTING RENDERING
+    # ==========================================================================
+    def _draw_todo(self):
+        w = self.lwin
+        if not w:
+            return
+        my, mx = w.getmaxyx()
+        active = self.panel == self.LEFT and self.left_section == self.SEC_TODO
+
+        visible = get_visible_tasks(self.todo.tasks)
+        n = len(visible)
+        done, total = count_all_tasks(self.todo.tasks)
+        title = f"todo {done}/{total}" if total else "todo"
+        
+        self._card(w, title, cpair=5, active=active)
+
+        ch = my - 4
+        if ch < 1:
+            w.noutrefresh()
+            return
+
+        if not self.todo.tasks:
+            msg = "no tasks — press a"
+            saddstr(w, my // 2, max(2, (mx - len(msg)) // 2), msg, curses.A_DIM)
+        else:
+            if self.lcur < self.lscroll:
+                self.lscroll = self.lcur
+            elif self.lcur >= self.lscroll + ch:
+                self.lscroll = self.lcur - ch + 1
+
+            vis = visible[self.lscroll:self.lscroll + ch]
+            for ri, item in enumerate(vis):
+                real_i = self.lscroll + ri
+                y = ri + 1
+
+                task = item["task"]
+                depth = item["depth"]
+                sel = real_i == self.lcur and active
+
+                if task.get("subtasks"):
+                    exp = "▼" if task.get("expanded", True) else "▶"
+                else:
+                    exp = " "
+
+                chk = "✓" if task["done"] else "○"
+
+                summary = task["summary"]
+                if task.get("subtasks"):
+                    sub_d, sub_t = count_subtasks(task)
+                    if sub_t > 0:
+                        summary += f" [{sub_d}/{sub_t}]"
+
+                indent_w = depth * 3
+                avail = mx - 9 - indent_w
+                if len(summary) > avail:
+                    summary = summary[: max(0, avail - 1)] + "…"
+
+                if task["done"]:
+                    attr = curses.A_DIM
+                elif sel:
+                    attr = curses.A_BOLD | curses.color_pair(5)
+                else:
+                    attr = curses.color_pair(6)
+
+                ind_a = curses.A_BOLD | curses.color_pair(5) if sel else curses.A_DIM
+                chk_a = curses.color_pair(1) if task["done"] else curses.A_DIM
+                exp_a = curses.color_pair(5) if task.get("subtasks") else curses.A_DIM
+
+                indent_str = "   " * depth
+                if depth > 0:
+                    indent_str = "   " * (depth - 1) + " └─"
+
+                saddstr(w, y, 2, "▸" if sel else " ", ind_a)
+                saddstr(w, y, 4, indent_str, curses.A_DIM)
+                
+                start_x = 4 + len(indent_str)
+                saddstr(w, y, start_x, exp, exp_a)
+                saddstr(w, y, start_x + 2, chk, chk_a)
+                saddstr(w, y, start_x + 4, summary, attr)
+
+            if self.lscroll > 0:
+                saddstr(w, 1, mx - 2, "▲", curses.A_DIM)
+            if self.lscroll + ch < n:
+                saddstr(w, my - 3, mx - 2, "▼", curses.A_DIM)
+
+        # Draw clickable button helpers at the bottom
+        add_sib_txt = " [+ task] "
+        add_sub_txt = " [+ subtask] "
+        edit_txt = " [✎ edit] "
+        del_txt = " [✕ delete] "
+        cx = 2
+        saddstr(w, my - 2, cx, add_sib_txt, curses.color_pair(1) | curses.A_REVERSE)
+        cx += len(add_sib_txt) + 1
+        saddstr(w, my - 2, cx, add_sub_txt, curses.color_pair(5) | curses.A_REVERSE)
+        cx += len(add_sub_txt) + 1
+        saddstr(w, my - 2, cx, edit_txt, curses.color_pair(3) | curses.A_REVERSE)
+        cx += len(edit_txt) + 1
+        saddstr(w, my - 2, cx, del_txt, curses.color_pair(4) | curses.A_REVERSE)
+
+        w.noutrefresh()
+
+    # ==========================================================================
+    # HABITS PANEL (lower-left)
+    # ==========================================================================
+    def _draw_habits(self):
+        w = self.hwin
+        if not w:
+            return
+        my, mx = w.getmaxyx()
+        active = self.panel == self.LEFT and self.left_section == self.SEC_HABITS
+
+        items = self.habits.habits
+        done_today = sum(1 for h in items if HabitManager.done_on(h, HabitManager.today()))
+        title = f"habits {done_today}/{len(items)}" if items else "habits"
+        self._card(w, title, cpair=7, active=active)
+
+        if not items:
+            msg = "no habits — press a"
+            saddstr(w, my // 2, max(2, (mx - len(msg)) // 2), msg, curses.A_DIM)
+        else:
+            n = len(items)
+            self.hcur = max(0, min(self.hcur, n - 1))
+            ch = max(1, my - 3)  # visible habit rows
+            # Keep the cursor inside the scroll window (same pattern as todo list).
+            if self.hcur < self.hscroll:
+                self.hscroll = self.hcur
+            elif self.hcur >= self.hscroll + ch:
+                self.hscroll = self.hcur - ch + 1
+            self.hscroll = max(0, min(self.hscroll, max(0, n - ch)))
+            today = datetime.now().date()
+            vis = items[self.hscroll:self.hscroll + ch]
+            for ri, h in enumerate(vis):
+                real_i = self.hscroll + ri
+                y = ri + 1
+                sel = real_i == self.hcur and active
+                checked = HabitManager.done_on(h, HabitManager.today())
+                chk = "✓" if checked else "○"
+                chk_a = curses.color_pair(1) if checked else curses.A_DIM
+                ind_a = curses.A_BOLD | curses.color_pair(7) if sel else curses.A_DIM
+                # 7-day mini grid (oldest → today) — minimal, no streak/emoji.
+                grid = ""
+                for d in range(6, -1, -1):
+                    day = (today - timedelta(days=d)).strftime("%Y-%m-%d")
+                    grid += "▪" if h["history"].get(day) else "▫"
+                name = h["name"]
+                avail = mx - 6 - len(grid) - 2
+                if len(name) > avail:
+                    name = name[:max(0, avail - 1)] + "…"
+                name_a = curses.A_BOLD | curses.color_pair(7) if sel else (
+                    curses.A_DIM if checked else curses.color_pair(6))
+                saddstr(w, y, 1, "▸" if sel else " ", ind_a)
+                saddstr(w, y, 3, chk, chk_a)
+                saddstr(w, y, 5, name, name_a)
+                gx = mx - len(grid) - 2
+                saddstr(w, y, gx, grid, curses.color_pair(1) if checked else curses.A_DIM)
+            # Scroll affordances
+            if self.hscroll > 0:
+                saddstr(w, 1, mx - 2, "▲", curses.A_DIM)
+            if self.hscroll + ch < n:
+                saddstr(w, my - 3, mx - 2, "▼", curses.A_DIM)
+
+        # Bottom helper buttons
+        add_txt = " [+ habit] "
+        del_txt = " [✕ del] "
+        saddstr(w, my - 2, 2, add_txt, curses.color_pair(1) | curses.A_REVERSE)
+        saddstr(w, my - 2, 2 + len(add_txt) + 1, del_txt, curses.color_pair(4) | curses.A_REVERSE)
+        w.noutrefresh()
+
+    # ==========================================================================
+    # RIGHT PANEL
+    # ==========================================================================
+    def _draw_right(self):
+        w = self.rwin
+        if not w:
+            return
+        my, mx = w.getmaxyx()
+        active = self.panel == self.RIGHT
+
+        if self.view == self.HOME:
+            self._card(w, "home", cpair=5, active=active)
+            self._v_home(w, my, mx)
+        elif self.view == self.TIMER:
+            t = "break" if self.is_break else "focus"
+            cp = 2 if self.is_break else 1
+            self._card(w, t, cpair=cp, active=active)
+            self._v_timer(w, my, mx)
+        elif self.view == self.SOUNDS:
+            self._card(w, "sounds", cpair=7, active=active)
+            self._v_sounds(w, my, mx)
+        elif self.view == self.STATS:
+            self._card(w, "stats", cpair=5, active=active)
+            self._v_stats(w, my, mx)
+        elif self.view == self.SETTINGS:
+            self._card(w, "settings", cpair=5, active=active)
+            self._v_settings(w, my, mx)
+        elif self.view == self.APPS:
+            self._card(w, "blocked apps", cpair=4, active=active)
+            self._v_blocklist(w, my, mx, self.cfg.blocked_apps, "app name (e.g. steam)")
+        elif self.view == self.APPS_SEARCH:
+            self._card(w, "fuzzy app search", cpair=5, active=active)
+            self._v_app_search(w, my, mx)
+
+        w.noutrefresh()
+
+    # ==========================================================================
+    # HOME VIEW
+    # ==========================================================================
+    def _v_home(self, w, my, mx):
+        # ── STOPWATCH IS THE PRIMARY FEATURE ──
+        total_study = self.cfg.study_total + self.study_session
+        sh = total_study // 3600
+        sm = (total_study % 3600) // 60
+        ss = total_study % 60
+        clock_str = f"{sh:02d}:{sm:02d}:{ss:02d}"
+
+        cx = mx // 2
+        cy = my // 2 - 1
+
+        # Big digit rendering — properly centered
+        total_w = len(clock_str) * 5 - 1  # 8 chars * 5 spacing - 1 = 39
+        sx = cx - total_w // 2
+
+        accent = curses.color_pair(1) | curses.A_BOLD if self.stopwatch_on else curses.color_pair(5) | curses.A_BOLD
+        for di, ch in enumerate(clock_str):
+            if ch in DIGITS:
+                for ro in range(5):
+                    saddstr(w, cy - 2 + ro, sx + di * 5, DIGITS[ch][ro], accent)
+
+        info_y = cy + 4
+        if self.stopwatch_on:
+            spinner = self.spin[self.spin_i] + " studying…"
+            saddstr(w, info_y, max(2, (mx - len(spinner)) // 2), spinner, curses.A_BOLD | curses.color_pair(1))
+        else:
+            hint = "press space to start · r to reset"
+            saddstr(w, info_y, max(2, (mx - len(hint)) // 2), hint, curses.A_DIM)
+
+        by = info_y + 2
+        btn_f = " [ ⏰ focus timer  f ] "
+        btn_s = " [ ⚙ settings  s ] "
+        gap = 3
+        total_btn = len(btn_f) + gap + len(btn_s)
+        bx = max(2, (mx - total_btn) // 2)
+        saddstr(w, by, bx, btn_f, curses.color_pair(1) | curses.A_REVERSE)
+        saddstr(w, by, bx + len(btn_f) + gap, btn_s, curses.color_pair(5) | curses.A_REVERSE)
+        # Register as clickable buttons (absolute coords: win origin row 1, col left_w)
+        self.register_btn("home_focus", 1 + by, self.left_w + bx, btn_f,
+                          lambda: self.switch_view(self.TIMER))
+        self.register_btn("home_settings", 1 + by, self.left_w + bx + len(btn_f) + gap, btn_s,
+                          lambda: self.switch_view(self.SETTINGS))
+
+        # Audio status
+        if self.audio.is_playing:
+            trk = self.audio.status_label()
+            ai = f"♫ {trk} · {self.audio.volume}%"
+            saddstr(w, by + 2, max(2, (mx - len(ai)) // 2), ai, curses.A_DIM)
+
+    # ==========================================================================
+    # TIMER VIEW
+    # ==========================================================================
+    def _v_timer(self, w, my, mx):
+        accent = curses.color_pair(2) if self.is_break else curses.color_pair(1)
+
+        ratio = 0.0
+        if self.total_sec > 0:
+            ratio = (self.total_sec - self.timer_sec) / self.total_sec
+
+        cy = my // 2 - 1
+        cx = mx // 2
+        R = max(7, min(cy - 2, (mx - 4) // 4, 14))
+        asp = 2.0
+
+        # Calculate digit dimensions
+        mins = int(self.timer_sec // 60)
+        secs = int(self.timer_sec % 60)
+        clock = f"{mins:02d}:{secs:02d}"
+        cstyle = curses.A_BOLD | (curses.color_pair(3) if self.timer_paused else accent)
+
+        total_w = len(clock) * 5 - 1  # 24 chars wide
+        sx = cx - total_w // 2
+        sy = cy - 2  # 5 rows: cy-2 to cy+2
+
+        use_big = R >= 7 and mx > total_w + 10
+
+        # Define digit bounding box for big digits
+        if use_big:
+            dig_top = sy
+            dig_bot = sy + 4
+            dig_left = sx - 1
+            dig_right = sx + total_w + 1
+        else:
+            dig_top = cy
+            dig_bot = cy
+            dig_left = cx - len(clock) // 2 - 1
+            dig_right = cx + len(clock) // 2 + 1
+
+        # Draw progress ring FIRST, skipping digit area
+        for yy in range(max(1, cy - R - 1), min(my - 1, cy + R + 2)):
+            for xx in range(max(1, cx - int(R * asp) - 1), min(mx - 1, cx + int(R * asp) + 1)):
+                # Skip pixels inside the digit bounding box
+                if dig_top <= yy <= dig_bot and dig_left <= xx <= dig_right:
+                    continue
+                dx = xx - cx
+                dy = (yy - cy) * asp
+                dist = math.sqrt(dx * dx + dy * dy)
+                if R - 0.8 <= dist <= R + 0.5:
+                    theta = (math.atan2(dx, -dy) + 2 * math.pi) % (2 * math.pi)
+                    p = theta / (2 * math.pi)
+                    if p <= ratio:
+                        saddstr(w, yy, xx, "█", accent | curses.A_BOLD)
+                    else:
+                        saddstr(w, yy, xx, "·", curses.A_DIM)
+
+        # Draw digits ON TOP of cleared center
+        if use_big:
+            for di, ch in enumerate(clock):
+                if ch in DIGITS:
+                    for ro in range(5):
+                        saddstr(w, sy + ro, sx + di * 5, DIGITS[ch][ro], cstyle)
+        else:
+            saddstr(w, cy, cx - len(clock) // 2, clock, cstyle)
+
+        info_y = min(my - 4, cy + R + 2)
+        if self.timer_on and not self.timer_paused:
+            if self.is_break:
+                spinner = self.spin[self.spin_i] + " on break…"
+            else:
+                spinner = self.spin[self.spin_i] + " focusing…"
+            saddstr(w, info_y, max(2, (mx - len(spinner)) // 2), spinner, curses.A_BOLD | accent)
+        elif self.timer_paused:
+            saddstr(w, info_y, max(2, (mx - 6) // 2), "paused", curses.A_BOLD | curses.color_pair(3))
+
+        target = self.cfg.pomodoro_target
+        if target > 0:
+            # Show progress toward the planned target: filled + empty dots and a
+            # numeric count so it's readable at a glance, e.g. "● ● ○ ○   2/4".
+            shown = min(target, 10)
+            filled = min(self.poms_done, shown)
+            dots = "● " * filled + "○ " * (shown - filled)
+            if target > 10:
+                dots += "… "
+            dots += f"  {self.poms_done}/{target}"
+            saddstr(w, info_y + 1, max(2, (mx - len(dots)) // 2), dots, curses.color_pair(4))
+        elif self.poms_done > 0:
+            dots = "● " * min(self.poms_done, 10)
+            if self.poms_done > 10:
+                dots += "… "
+            dots += f"  {self.poms_done}"
+            saddstr(w, info_y + 1, max(2, (mx - len(dots)) // 2), dots, curses.color_pair(4))
+
+        if self.audio.is_playing:
+            trk = self.audio.status_label()
+            ai = f"♫ {trk} · {self.audio.volume}%"
+            saddstr(w, info_y + 2, max(2, (mx - len(ai)) // 2), ai, curses.A_DIM)
+
+        # Mouse clickable control buttons
+        lbl_p = " [ ⏸ pause ] " if not self.timer_paused else " [ ▶ resume ] "
+        lbl_r = " [ ↺ reset ] "
+        total_btn_w = len(lbl_p) + 5 + len(lbl_r)
+        bx = (mx - total_btn_w) // 2
+        btn_y = info_y + 3
+        saddstr(w, btn_y, bx, lbl_p, curses.color_pair(3) | curses.A_REVERSE)
+        saddstr(w, btn_y, bx + len(lbl_p) + 5, lbl_r, curses.color_pair(4) | curses.A_REVERSE)
+        # Clickable (absolute coords: right win origin row 1, col left_w)
+        self.register_btn("timer_pause", 1 + btn_y, self.left_w + bx, lbl_p,
+                          self._timer_toggle)
+        self.register_btn("timer_reset", 1 + btn_y, self.left_w + bx + len(lbl_p) + 5, lbl_r,
+                          self._timer_reset_home)
+
+    # ==========================================================================
+    # SOUNDS VIEW
+    # ==========================================================================
+    def _v_sounds(self, w, my, mx):
+        active = self.panel == self.RIGHT
+        # Mixer hint: more than one sound can play at once.
+        cnt = self.audio.active_count()
+        if cnt:
+            mute_tag = "  (muted)" if self.audio.muted else ""
+            saddstr(w, 1, mx - 22, f"{cnt} playing{mute_tag}", curses.color_pair(1) | curses.A_BOLD)
+        for idx, snd in enumerate(self.audio.sounds):
+            y = idx + 2
+            if y >= my - 2:
+                break
+            sel = idx == self.rcur and active
+            playing = self.audio.is_active(idx)
+
+            ind = "▸" if sel else " "
+            bullet = "▶" if playing else "○"
+            b_attr = curses.A_BOLD | curses.color_pair(1) if playing else curses.A_DIM
+            n_attr = curses.A_BOLD if (sel or playing) else curses.color_pair(6)
+
+            saddstr(w, y, 3, ind, curses.A_BOLD | curses.color_pair(5) if sel else curses.A_DIM)
+            saddstr(w, y, 5, bullet, b_attr)
+            saddstr(w, y, 7, snd["name"], n_attr)
+
+        vy = len(self.audio.sounds) + 3
+        if vy < my - 2:
+            v = self.audio.volume
+            bw = max(6, min(20, mx - 30))
+            filled = int(v / 100 * bw)
+            saddstr(w, vy, 3, "vol  [ – ] ", curses.A_DIM)
+            saddstr(w, vy, 15, "━" * filled, curses.color_pair(1) | curses.A_BOLD)
+            saddstr(w, vy, 15 + filled, "─" * (bw - filled), curses.A_DIM)
+            saddstr(w, vy, 15 + bw + 2, f" [ + ]  {v}%", curses.A_DIM)
+            saddstr(w, vy + 1, 3, "click a sound to add/remove it from the mix", curses.A_DIM)
+
+    # ==========================================================================
+    # SETTINGS VIEW
+    # ==========================================================================
+    def _toggle_cfg(self, attr, realloc=False):
+        setattr(self.cfg, attr, not getattr(self.cfg, attr))
+        self.cfg.save()
+        if realloc:
+            self._alloc()
+
+    def _open_apps(self):
+        self.view = self.APPS
+        self.rcur = 0
+        self.rscroll = 0
+        self._alloc()
+
+    @staticmethod
+    def _parse_date(val):
+        """Parse a human-typed date into normalized 'YYYY-MM-DD'.
+
+        Accepts many separators (/ . - space) and orderings: day-first
+        (30/8/26), ISO (2026-08-30) and 2-digit years (26 → 2026). When the
+        first/second fields are obviously reversed (US 8/30/26) they're
+        swapped. 'none'/'clear'/'-'/'' clears the countdown (returns '').
+        Raises ValueError with a short hint on genuinely unparseable input."""
+        v = (val or "").strip().lower()
+        if v in ("", "none", "clear", "-", "off"):
+            return ""
+        # Split on any run of common date separators.
+        toks = []
+        cur = ""
+        for ch in val.strip():
+            if ch in "/.-, ":
+                if cur:
+                    toks.append(cur)
+                    cur = ""
+            else:
+                cur += ch
+        if cur:
+            toks.append(cur)
+        if len(toks) != 3 or not all(t.isdigit() for t in toks):
+            raise ValueError("use DD/MM/YYYY")
+        a, b, c = (int(t) for t in toks)
+        # Decide which field is the year: a 4-digit leading field => ISO order.
+        if len(toks[0]) == 4:
+            year, month, day = a, b, c
+        else:
+            day, month, year = a, b, c
+            if year < 100:                       # 2-digit year → 20xx
+                year += 2000
+        # Auto-correct an obviously reversed day/month (e.g. US 8/30/26).
+        if month > 12 and day <= 12:
+            day, month = month, day
+        try:
+            return datetime(year, month, day).strftime("%Y-%m-%d")
+        except ValueError:
+            raise ValueError("not a real date")
+
+    def _flash(self, msg):
+        self._flash_msg = msg
+        self._flash_t = time.time()
+        self.dirty = True
+
+    def _export_choose(self):
+        """Help the user pick a destination folder for the stats export.
+
+        New users rarely know what path to type, so we try, in order:
+          1. a native folder-picker *window* (osascript on macOS, zenity/kdialog
+             on Linux desktops),
+          2. a terminal *fuzzy finder* (fzf) over common destinations,
+          3. a plain typed path (with a format hint) as the universal fallback.
+        Any of these may be unavailable; we always degrade gracefully."""
+        path = self._pick_dir_gui() or self._pick_dir_fzf()
+        # The picker blocks the loop (and may suspend curses for fzf); don't let
+        # that wall-clock gap be counted as focus/stopwatch time on resume.
+        now = time.time()
+        self.last_tick_time = now
+        self.last_study_tick = now
+        self.dirty = True
+        if path:
+            self._export_stats(path)
+        else:
+            self._begin_input("export_path")
+
+    def _pick_dir_gui(self):
+        """Open a native folder-picker window. Returns a directory path, or None
+        if no GUI tool is present or the user cancelled."""
+        home = get_user_home()
+        tools = []
+        if sys.platform == "darwin" and shutil.which("osascript"):
+            tools.append([
+                "osascript",
+                "-e", 'set f to choose folder with prompt "Choose a folder to export flow stats"',
+                "-e", "POSIX path of f",
+            ])
+        if shutil.which("zenity"):
+            tools.append([
+                "zenity", "--file-selection", "--directory",
+                "--title=Choose a folder to export flow stats",
+                f"--filename={home}/",
+            ])
+        if shutil.which("kdialog"):
+            tools.append([
+                "kdialog", "--getexistingdirectory", home,
+                "--title", "Choose a folder to export flow stats",
+            ])
+        for cmd in tools:
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                path = (out.stdout or "").strip()
+                if out.returncode == 0 and path and os.path.isdir(path):
+                    return path
+            except Exception:
+                continue  # tool missing a display / errored — try the next one
+        return None
+
+    def _pick_dir_fzf(self):
+        """Fuzzy-pick a folder with fzf in the terminal. Suspends curses while
+        fzf owns the screen, then restores it. Returns a path or None."""
+        if not shutil.which("fzf"):
+            return None
+        home = get_user_home()
+        candidates = [home, os.getcwd()]
+        for sub in ("Desktop", "Documents", "Downloads"):
+            p = os.path.join(home, sub)
+            if os.path.isdir(p):
+                candidates.append(p)
+        feed = "\n".join(dict.fromkeys(candidates))  # dedupe, preserve order
+        curses.def_prog_mode()
+        curses.endwin()
+        path = ""
+        try:
+            out = subprocess.run(
+                ["fzf", "--prompt=export to> ", "--height=40%", "--reverse",
+                 "--header=Pick a folder for flow stats (type to filter)"],
+                input=feed, capture_output=True, text=True)
+            path = (out.stdout or "").strip()
+        except Exception:
+            path = ""
+        finally:
+            curses.reset_prog_mode()
+            self.stdscr.refresh()
+            curses.doupdate()
+        return path if path and os.path.isdir(path) else None
+
+    def _export_stats(self, path):
+        """Write focus + habit stats as JSON and CSV into a user-chosen folder."""
+        target = os.path.expanduser((path or "").strip() or "~")
+        try:
+            # If the user typed a file path, export alongside it; else treat as dir.
+            if os.path.splitext(target)[1]:
+                target = os.path.dirname(target) or "."
+            os.makedirs(target, exist_ok=True)
+            today = datetime.now().strftime("%Y-%m-%d")
+            daily = self.cfg.daily_study if isinstance(self.cfg.daily_study, dict) else {}
+            payload = {
+                "exported": datetime.now().isoformat(timespec="seconds"),
+                "study_total_seconds": self.cfg.study_total,
+                "daily_goal_seconds": self.cfg.daily_goal_seconds,
+                "daily_study_seconds": daily,
+                "habits": [{"name": h["name"], "history": h["history"]} for h in self.habits.habits],
+            }
+            jpath = os.path.join(target, "flow_stats.json")
+            with open(jpath, "w") as f:
+                json.dump(payload, f, indent=2)
+            cpath = os.path.join(target, "flow_focus.csv")
+            with open(cpath, "w") as f:
+                f.write("date,focus_seconds,focus_hm\n")
+                for d in sorted(daily):
+                    f.write(f"{d},{daily[d]},{self._fmt_hm(daily[d])}\n")
+            hpath = os.path.join(target, "flow_habits.csv")
+            with open(hpath, "w") as f:
+                f.write("habit,date_completed\n")
+                for h in self.habits.habits:
+                    for d in sorted(h["history"]):
+                        if h["history"][d]:
+                            f.write(f"\"{h['name']}\",{d}\n")
+            self._flash(f"Exported stats → {target}")
+        except Exception as e:
+            self._flash(f"Export failed: {e}")
+
+    def _build_settings(self):
+        """Single source of truth: (label, value, action). Rendering, keyboard
+        and mouse all derive index→action from this one list — no drift.
+
+        Rows are grouped under section headers. A header is a (title, None, None)
+        row: value AND action are None, which marks it non-selectable so nav,
+        scroll, hover and click all skip it (see _settings_selectable)."""
+        c = self.cfg
+        cd = c.countdown_date or "—"
+        H = lambda title: (title, None, None)  # section header sentinel
+        return [
+            H("Timer"),
+            ("Focus Duration", f"{c.work_dur} min", lambda: self._begin_input("work_dur")),
+            ("Short Break", f"{c.short_break_dur} min", lambda: self._begin_input("short_dur")),
+            ("Long Break", f"{c.long_break_dur} min", lambda: self._begin_input("long_dur")),
+            ("Daily Focus Goal", self._fmt_hm(c.daily_goal_seconds), lambda: self._begin_input("daily_goal")),
+            ("Auto-start Sessions", "on" if c.auto_start else "off", lambda: self._toggle_cfg("auto_start")),
+            ("Session Target", "unlimited" if c.pomodoro_target == 0 else str(c.pomodoro_target),
+             lambda: self._begin_input("session_target")),
+            H("Countdown"),
+            ("Countdown Name", c.countdown_name or "—", lambda: self._begin_input("countdown_name")),
+            ("Countdown Date", cd, lambda: self._begin_input("countdown_date")),
+            H("Audio"),
+            ("Sound", "on" if c.sound_enabled else "off", lambda: self._toggle_cfg("sound_enabled")),
+            ("Notifications", "on" if c.notifications else "off", lambda: self._toggle_cfg("notifications")),
+            H("Visualizer"),
+            ("Visualizer", "on" if c.visualizer else "off", lambda: self._toggle_cfg("visualizer", realloc=True)),
+            ("Visualizer Height", f"{c.visualizer_rows} rows", lambda: self._begin_input("vis_rows")),
+            ("Visualizer Bars", f"{c.vis_bars}", lambda: self._begin_input("vis_bars")),
+            ("Visualizer Amplitude", f"{c.vis_amplitude}%", lambda: self._begin_input("vis_amp")),
+            H("App Blocker"),
+            ("App Blocker", "active" if c.block_apps else "off", lambda: self._toggle_cfg("block_apps")),
+            ("Blocked Apps →", f"{len(c.blocked_apps)} apps", self._open_apps),
+            H("Data"),
+            ("Export Stats →", "json + csv", self._export_choose),
+        ]
+
+    def _settings_selectable(self, idx):
+        """True if row idx is an actionable setting (not a section header)."""
+        items = getattr(self, "_settings_items", None) or self._build_settings()
+        return 0 <= idx < len(items) and items[idx][2] is not None
+
+    def _settings_move(self, delta):
+        """Move the settings cursor by delta, skipping section headers."""
+        items = getattr(self, "_settings_items", None) or self._build_settings()
+        n = len(items)
+        i = self.rcur + delta
+        while 0 <= i < n and items[i][2] is None:
+            i += delta
+        if 0 <= i < n:
+            self.rcur = i
+
+    def _settings_snap(self):
+        """Ensure rcur sits on a selectable row (used on entry / after rebuild)."""
+        items = getattr(self, "_settings_items", None) or self._build_settings()
+        n = len(items)
+        if 0 <= self.rcur < n and items[self.rcur][2] is not None:
+            return
+        for d in (1, -1):  # search forward first, then backward
+            i = self.rcur
+            while 0 <= i < n:
+                if items[i][2] is not None:
+                    self.rcur = i
+                    return
+                i += d
+
+    def _v_settings(self, w, my, mx):
+        active = self.panel == self.RIGHT
+        items = self._build_settings()
+        self._settings_items = items
+        n = len(items)
+        self._settings_n = n  # nav/mouse bounds
+        self.rcur = max(0, min(self.rcur, n - 1))
+        self._settings_snap()  # never rest on a section header
+        ch = max(1, my - 3)  # visible rows (2 .. my-2)
+        if self.rcur < self.rscroll:
+            self.rscroll = self.rcur
+        elif self.rcur >= self.rscroll + ch:
+            self.rscroll = self.rcur - ch + 1
+        self.rscroll = max(0, min(self.rscroll, max(0, n - ch)))
+        vis = items[self.rscroll:self.rscroll + ch]
+        for ri, (label, val, action) in enumerate(vis):
+            idx = self.rscroll + ri
+            y = ri + 2
+            if action is None:  # section header — dim title, no selection/value
+                saddstr(w, y, 3, f"── {label} ──", curses.A_BOLD | curses.color_pair(4))
+                continue
+            sel = idx == self.rcur and active
+            ind = "▸" if sel else " "
+            ind_a = curses.A_BOLD | curses.color_pair(5) if sel else curses.A_DIM
+            lab_a = curses.A_BOLD if sel else curses.color_pair(6)
+            if val in ("on", "active"):
+                val_a = curses.color_pair(1) | curses.A_BOLD
+            elif val == "off":
+                val_a = curses.A_DIM
+            else:
+                val_a = curses.color_pair(5)
+            saddstr(w, y, 5, ind, ind_a)
+            saddstr(w, y, 7, label, lab_a)
+            vx = min(mx - len(val) - 3, 32)
+            saddstr(w, y, vx, val, val_a)
+        if self.rscroll > 0:
+            saddstr(w, 2, mx - 2, "▲", curses.A_DIM)
+        if self.rscroll + ch < n:
+            saddstr(w, my - 2, mx - 2, "▼", curses.A_DIM)
+
+    def _settings_action(self, idx):
+        items = getattr(self, "_settings_items", None) or self._build_settings()
+        if 0 <= idx < len(items) and items[idx][2] is not None:
+            items[idx][2]()
+
+    # ==========================================================================
+    # STATS VIEW — daily / weekly / monthly calendar of study time
+    # ==========================================================================
+    def _study_for(self, date_str):
+        """Study seconds recorded for a YYYY-MM-DD string (live total for today)."""
+        d = self.cfg.daily_study if isinstance(self.cfg.daily_study, dict) else {}
+        secs = d.get(date_str, 0)
+        if date_str == datetime.now().strftime("%Y-%m-%d"):
+            secs += self.study_session  # include the in-progress session
+        return secs
+
+    @staticmethod
+    def _fmt_hm(secs):
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        if h:
+            return f"{h}h {m:02d}m"
+        return f"{m}m"
+
+    @staticmethod
+    def _circle(pct):
+        if pct <= 0.05:
+            return "○"
+        if pct <= 0.35:
+            return "◔"
+        if pct <= 0.65:
+            return "◑"
+        if pct <= 0.85:
+            return "◕"
+        return "●"
+
+    def _v_stats(self, w, my, mx):
+        # Sub-view tabs (clickable + 1/2/3 keys)
+        modes = [("daily", "Daily"), ("habits", "Habits"), ("month", "Month"), ("year", "Year")]
+        tx = 3
+        for i, (_, label) in enumerate(modes):
+            txt = f"[ {label} ]"
+            style = curses.color_pair(1) | curses.A_REVERSE if self.stats_mode == i else curses.A_DIM
+            saddstr(w, 1, tx, txt, style)
+            self.register_btn(f"stats_{i}", 1 + 1, self.left_w + tx, txt,
+                              lambda i=i: self._set_stats_mode(i))
+            tx += len(txt) + 1
+
+        if self.stats_mode == 0:
+            self._stats_daily(w, my, mx)
+        elif self.stats_mode == 1:
+            self._stats_habits(w, my, mx)
+        elif self.stats_mode == 2:
+            self._stats_calendar(w, my, mx)
+        else:
+            self._stats_year(w, my, mx)
+
+    def _set_stats_mode(self, i):
+        self.stats_mode = i
+        self.cal_offset = 0
+        self.dirty = True
+
+    def _goal_streaks(self):
+        """(current, longest) run of consecutive days that met the daily goal.
+        An in-progress today that hasn't hit the goal yet doesn't break the run."""
+        goal = max(1, self.cfg.daily_goal_seconds)
+        today = datetime.now().date()
+        met = lambda d: self._study_for(d.strftime("%Y-%m-%d")) >= goal
+        # Current: start at today if met, else yesterday; count back while met.
+        cur = 0
+        d = today if met(today) else today - timedelta(days=1)
+        for _ in range(3660):
+            if met(d):
+                cur += 1
+                d -= timedelta(days=1)
+            else:
+                break
+        # Longest: scan from the earliest recorded day to today.
+        daily = self.cfg.daily_study if isinstance(self.cfg.daily_study, dict) else {}
+        longest = run = 0
+        if daily:
+            try:
+                start = min(datetime.strptime(k, "%Y-%m-%d").date() for k in daily)
+            except Exception:
+                start = today
+            d = start
+            while d <= today:
+                if met(d):
+                    run += 1
+                    longest = max(longest, run)
+                else:
+                    run = 0
+                d += timedelta(days=1)
+        longest = max(longest, cur)
+        return cur, longest
+
+    def _range_total(self, start_days_ago, span):
+        today = datetime.now().date()
+        return sum(self._study_for((today - timedelta(days=start_days_ago - i)).strftime("%Y-%m-%d"))
+                   for i in range(span))
+
+    def _stats_daily(self, w, my, mx):
+        today = datetime.now()
+        today_secs = self._study_for(today.strftime("%Y-%m-%d"))
+        goal = max(1, self.cfg.daily_goal_seconds)
+        total = self.cfg.study_total + self.study_session
+        # Header: today + goal progress + lifetime
+        saddstr(w, 3, 4, "Today", curses.A_BOLD | curses.color_pair(5))
+        pct = int(today_secs / goal * 100)
+        saddstr(w, 3, 12, f"{self._fmt_hm(today_secs)}  {self._circle(today_secs / goal)} {pct}% of goal",
+                curses.A_BOLD | curses.color_pair(1))
+        saddstr(w, 3, mx - 20, f"lifetime {self._fmt_hm(total)}", curses.A_DIM)
+        # Summary metrics block
+        week = self._range_total(0, 7)
+        last_week = self._range_total(7, 7)
+        avg = week // 7
+        cur_streak, best_streak = self._goal_streaks()
+        daily = self.cfg.daily_study if isinstance(self.cfg.daily_study, dict) else {}
+        best_day, best_secs = "—", 0
+        live = dict(daily)
+        live[today.strftime("%Y-%m-%d")] = today_secs
+        if live:
+            best_day = max(live, key=lambda k: live[k])
+            best_secs = live[best_day]
+        trend = "▲" if week >= last_week else "▼"
+        trend_a = curses.color_pair(1) if week >= last_week else curses.color_pair(4)
+        rows = [
+            (f"7-day total  {self._fmt_hm(week)}", f"avg/day {self._fmt_hm(avg)}"),
+            (f"this week {self._fmt_hm(week)} {trend} last {self._fmt_hm(last_week)}", ""),
+            (f"goal streak  {cur_streak}d", f"best {best_streak}d"),
+            (f"best day  {best_day}", self._fmt_hm(best_secs)),
+        ]
+        ry = 5
+        for left, right in rows:
+            if ry >= my - 3:
+                break
+            saddstr(w, ry, 4, left, curses.color_pair(6))
+            if right:
+                saddstr(w, ry, max(4, mx - len(right) - 4), right, curses.A_DIM)
+            if left.startswith("this week"):
+                saddstr(w, ry, 4 + len(f"this week {self._fmt_hm(week)} "), trend, trend_a | curses.A_BOLD)
+            ry += 1
+        # Recent days list (fills remaining space)
+        ry += 1
+        if ry < my - 2:
+            saddstr(w, ry, 4, "Recent", curses.A_BOLD | curses.color_pair(5))
+            ry += 1
+            peak = max((self._study_for((today - timedelta(days=i)).strftime("%Y-%m-%d")) for i in range(14)), default=0) or 1
+            for i in range(min(14, my - ry - 1)):
+                d = today - timedelta(days=i)
+                ds = d.strftime("%Y-%m-%d")
+                secs = self._study_for(ds)
+                label = "today" if i == 0 else ("yesterday" if i == 1 else d.strftime("%a %b %d"))
+                bar_w = max(0, min(mx - 30, int(secs / peak * (mx - 30))))
+                a = curses.color_pair(1) if secs >= goal else curses.color_pair(3) if secs else curses.A_DIM
+                saddstr(w, ry, 4, label, curses.color_pair(6))
+                saddstr(w, ry, 18, "▓" * bar_w, a)
+                saddstr(w, ry, 18 + bar_w + 1, self._fmt_hm(secs), curses.A_DIM)
+                ry += 1
+
+    def _stats_habits(self, w, my, mx):
+        habits = self.habits.habits
+        today = datetime.now().date()
+        days = [today - timedelta(days=(6 - i)) for i in range(7)]  # oldest→today
+        saddstr(w, 3, 4, "Habits — last 7 days", curses.A_BOLD | curses.color_pair(5))
+        hx = 22
+        for i, d in enumerate(days):
+            saddstr(w, 5, hx + i * 3, d.strftime("%a")[0], curses.A_DIM)
+        if not habits:
+            saddstr(w, 7, 4, "no habits yet — add them in the left panel", curses.A_DIM)
+            return
+        rate_x = hx + 7 * 3 + 2
+        saddstr(w, 5, rate_x, "30d", curses.A_DIM)
+        saddstr(w, 5, rate_x + 6, "streak", curses.A_DIM)
+        for r, h in enumerate(habits):
+            y = 6 + r
+            if y >= my - 2:
+                break
+            name = h["name"][:16]
+            saddstr(w, y, 4, name, curses.color_pair(6))
+            for i, d in enumerate(days):
+                done = bool(h["history"].get(d.strftime("%Y-%m-%d")))
+                mark = "●" if done else "○"
+                a = curses.color_pair(1) if done else curses.A_DIM
+                saddstr(w, y, hx + i * 3, mark, a)
+            # 30-day completion rate + current streak
+            done30 = sum(1 for k in range(30)
+                         if h["history"].get((today - timedelta(days=k)).strftime("%Y-%m-%d")))
+            pct = int(done30 / 30 * 100)
+            streak = self.habits.streak(h)
+            ra = curses.color_pair(1) if pct >= 70 else curses.color_pair(3) if pct >= 30 else curses.A_DIM
+            saddstr(w, y, rate_x, f"{pct:3d}%", ra)
+            saddstr(w, y, rate_x + 6, f"{streak}d", curses.color_pair(6) if streak else curses.A_DIM)
+
+    def _stats_year(self, w, my, mx):
+        today = datetime.now()
+        year = today.year
+        goal = max(1, self.cfg.daily_goal_seconds)
+        saddstr(w, 3, 4, f"{year} — monthly focus", curses.A_BOLD | curses.color_pair(5))
+        year_total = 0
+        for m in range(1, 13):
+            days_in = _calendar.monthrange(year, m)[1]
+            msecs = sum(self._study_for(f"{year:04d}-{m:02d}-{d:02d}") for d in range(1, days_in + 1))
+            year_total += msecs
+            pct = msecs / (goal * days_in)
+            y = 5 + (m - 1)
+            if y >= my - 2:
+                break
+            circ = self._circle(pct)
+            a = curses.color_pair(1) | curses.A_BOLD if pct >= 0.86 else (
+                curses.color_pair(1) if pct > 0.05 else curses.A_DIM)
+            saddstr(w, y, 4, _calendar.month_name[m][:3], curses.color_pair(6))
+            saddstr(w, y, 9, circ, a)
+            saddstr(w, y, 12, self._fmt_hm(msecs), curses.A_DIM)
+        saddstr(w, my - 2, 4, f"year total  {self._fmt_hm(year_total)}",
+                curses.A_BOLD | curses.color_pair(1))
+
+    def _stats_weekly(self, w, my, mx):
+        today = datetime.now()
+        # Monday as start of week
+        monday = today - timedelta(days=today.weekday())
+        days = [monday + timedelta(days=i) for i in range(7)]
+        secs = [self._study_for(d.strftime("%Y-%m-%d")) for d in days]
+        peak = max(secs) or 1
+        saddstr(w, 3, 4, f"Week of {monday.strftime('%b %d')}", curses.A_BOLD | curses.color_pair(5))
+        chart_h = max(3, min(8, my - 9))
+        base_y = 4 + chart_h
+        col_w = max(3, min(8, (mx - 8) // 7))
+        for i, (d, s) in enumerate(zip(days, secs)):
+            x = 5 + i * col_w
+            filled = int(s / peak * chart_h * 8)  # 8 sub-levels per row
+            for r in range(chart_h):
+                row_y = base_y - 1 - r
+                cell = filled - r * 8
+                if cell >= 8:
+                    ch = "█"
+                elif cell > 0:
+                    ch = Visualizer.BLOCKS[cell]
+                else:
+                    ch = " "
+                col = curses.color_pair(1) if s else curses.A_DIM
+                saddstr(w, row_y, x, ch * (col_w - 1), col)
+            is_today = d.date() == today.date()
+            lab_a = curses.A_BOLD | curses.color_pair(3) if is_today else curses.A_DIM
+            saddstr(w, base_y, x, d.strftime("%a")[:col_w - 1], lab_a)
+            saddstr(w, base_y + 1, x, self._fmt_hm(s)[:col_w - 1], curses.A_DIM)
+        total = sum(secs)
+        saddstr(w, base_y + 3, 4, f"week total  {self._fmt_hm(total)}",
+                curses.A_BOLD | curses.color_pair(1))
+
+    def _stats_calendar(self, w, my, mx):
+        today = datetime.now()
+        # Apply month offset
+        month = today.month - self.cal_offset
+        year = today.year
+        while month <= 0:
+            month += 12
+            year -= 1
+        first_wd, days_in_month = _calendar.monthrange(year, month)  # Mon=0
+        first_wd = int(first_wd)
+        title = f"{_calendar.month_name[month]} {year}"
+        saddstr(w, 3, 4, "‹", curses.color_pair(5) | curses.A_BOLD)
+        saddstr(w, 3, 6, title, curses.A_BOLD | curses.color_pair(5))
+        saddstr(w, 3, 6 + len(title) + 1, "›", curses.color_pair(5) | curses.A_BOLD)
+        self.register_btn("cal_prev", 1 + 3, self.left_w + 4, "‹", lambda: self._cal_nav(1))
+        self.register_btn("cal_next", 1 + 3, self.left_w + 6 + len(title) + 1, "›",
+                          lambda: self._cal_nav(-1))
+        # Weekday headers
+        hdr = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+        cw = 4
+        for i, h in enumerate(hdr):
+            saddstr(w, 5, 4 + i * cw, h, curses.A_DIM)
+        # Goal-based progress circles ○◔◑◕● scaled to the daily focus goal.
+        goal = max(1, self.cfg.daily_goal_seconds)
+        row = 6
+        col = first_wd
+        month_total = 0
+        for day in range(1, days_in_month + 1):
+            ds = f"{year:04d}-{month:02d}-{day:02d}"
+            secs = self._study_for(ds)
+            month_total += secs
+            pct = secs / goal
+            circ = self._circle(pct)
+            x = 4 + col * cw
+            is_today = (year == today.year and month == today.month and day == today.day)
+            cell_a = curses.color_pair(1) | curses.A_BOLD if pct >= 0.86 else (
+                curses.color_pair(1) if pct > 0.05 else curses.A_DIM)
+            if is_today:
+                cell_a = curses.color_pair(3) | curses.A_BOLD
+            saddstr(w, row, x, f"{day:2d}", curses.A_DIM if not is_today else cell_a)
+            saddstr(w, row, x + 2, circ, cell_a)
+            col += 1
+            if col > 6:
+                col = 0
+                row += 1
+            if row >= my - 3:
+                break
+        saddstr(w, my - 3, 4,
+                f"month total  {self._fmt_hm(month_total)}   goal/day {self._fmt_hm(goal)}",
+                curses.A_BOLD | curses.color_pair(1))
+
+    def _cal_nav(self, delta):
+        self.cal_offset = max(0, self.cal_offset + delta)
+        self.dirty = True
+
+    # ==========================================================================
+    # BLOCKED APPS / SITES LIST VIEW
+    # ==========================================================================
+    def _v_blocklist(self, w, my, mx, items, hint):
+        active = self.panel == self.RIGHT
+        if not items:
+            msg = "empty — click add or press a"
+            saddstr(w, my // 2, max(2, (mx - len(msg)) // 2), msg, curses.A_DIM)
+        else:
+            ch = my - 5
+            if self.rcur < self.rscroll:
+                self.rscroll = self.rcur
+            elif self.rcur >= self.rscroll + ch:
+                self.rscroll = self.rcur - ch + 1
+
+            vis = items[self.rscroll:self.rscroll + ch]
+            for ri, item in enumerate(vis):
+                real_i = self.rscroll + ri
+                y = ri + 2
+                if y >= my - 3:
+                    break
+                sel = real_i == self.rcur and active
+                ind = "▸" if sel else " "
+                ind_a = curses.A_BOLD | curses.color_pair(5) if sel else curses.A_DIM
+                it_a = curses.A_BOLD if sel else curses.color_pair(6)
+                saddstr(w, y, 3, ind, ind_a)
+                saddstr(w, y, 5, item, it_a)
+
+            if self.rscroll > 0:
+                saddstr(w, 2, mx - 2, "▲", curses.A_DIM)
+            if self.rscroll + ch < len(items):
+                saddstr(w, my - 4, mx - 2, "▼", curses.A_DIM)
+
+        # Bottom row action helpers
+        btn_add = " [+ add] "
+        btn_del = " [✕ delete] "
+        saddstr(w, my - 2, 3, btn_add, curses.color_pair(1) | curses.A_REVERSE)
+        saddstr(w, my - 2, 3 + len(btn_add) + 2, btn_del, curses.color_pair(4) | curses.A_REVERSE)
+
+    # ==========================================================================
+    # FUZZY APPS INSTALLED SEARCH VIEW
+    # ==========================================================================
+    def _v_app_search(self, w, my, mx):
+        active = self.panel == self.RIGHT
+        prompt = f" Search app: {self.app_search_q}█"
+        saddstr(w, 2, 3, prompt, curses.A_BOLD | curses.color_pair(3))
+        saddstr(w, 3, 3, "─" * (mx - 6), curses.A_DIM)
+        
+        ch = my - 6
+        if self.rcur < self.rscroll:
+            self.rscroll = self.rcur
+        elif self.rcur >= self.rscroll + ch:
+            self.rscroll = self.rcur - ch + 1
+            
+        vis = self.app_search_results[self.rscroll:self.rscroll + ch]
+        for ri, app in enumerate(vis):
+            real_i = self.rscroll + ri
+            y = ri + 4
+            if y >= my - 2:
+                break
+            sel = real_i == self.rcur and active
+            ind = "▸" if sel else " "
+            ind_a = curses.A_BOLD | curses.color_pair(5) if sel else curses.A_DIM
+            app_a = curses.A_BOLD if sel else curses.color_pair(6)
+            saddstr(w, y, 3, ind, ind_a)
+            saddstr(w, y, 5, app, app_a)
+            
+        if self.rscroll > 0:
+            saddstr(w, 3, mx - 2, "▲", curses.A_DIM)
+        if self.rscroll + ch < len(self.app_search_results):
+            saddstr(w, my - 3, mx - 2, "▼", curses.A_DIM)
+
+
+if __name__ == "__main__":
+    FlowTUI().run()

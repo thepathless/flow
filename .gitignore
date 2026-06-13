@@ -1,0 +1,32 @@
+# Python / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+*.tar.gz
+
+# AppImage build leftovers
+linux/appimage/build/
+linux/appimage/*.AppImage
+linux/appimage/squashfs-root/
+*.AppImage
+appimagetool-*.AppImage
+
+# Native package outputs
+*.pkg.tar.zst
+*.deb
+*.rpm
+pkg/
+src/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Stray local dumps (e.g. directory listings captured during development)
+*-ls.txt

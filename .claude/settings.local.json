@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "Read(//tmp/**)",
+      "Bash(rm -rf cliamp)",
+      "Bash(gh repo *)",
+      "Bash(python3 -m py_compile flow)",
+      "Bash(command -v cava)",
+      "Bash(sed -n '/def _v_settings/,/def _settings_action/p' flow)",
+      "Bash(sed -n '/def _settings_action/,/def _save_input/p' flow)"
+    ]
+  }
+}

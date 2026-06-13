@@ -1,0 +1,47 @@
+# Maintainer: <your name> <you@example.com>
+#
+# AUR package for `flow` — a single-file, dependency-free terminal focus app.
+# Install with:  yay -S flow-tui     (or: paru -S flow-tui)
+#
+# After editing pkgver, refresh checksums with `updpkgsums`, regenerate metadata
+# with `makepkg --printsrcinfo > .SRCINFO`, then push both to the AUR.
+
+pkgname=flow-tui
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Mouse-first terminal focus app: Pomodoro timer, todos, habit tracker, ambient audio and an app blocker"
+arch=('any')
+url="https://github.com/<your-username>/flow"
+license=('MIT')
+depends=('python')
+optdepends=(
+  'mpv: ambient / lofi audio playback'
+  'libpulse: transition chimes via paplay'
+  'cava: real audio-reactive visualizer'
+  'zenity: native folder picker for stats export'
+  'fzf: terminal fuzzy folder picker for stats export'
+)
+# A real binary at /usr/bin/flow that runs the script from /usr/share/flow so the
+# bundled ambient track sits beside it (flow looks for assets next to __file__).
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # run `updpkgsums` to pin the real hash before publishing
+
+package() {
+  cd "$srcdir/flow-$pkgver"
+
+  # App + bundled ambient recording under /usr/share/flow.
+  install -Dm755 flow "$pkgdir/usr/share/flow/flow"
+  local mp3
+  mp3=$(ls krishna*.mp3 2>/dev/null | head -1 || true)
+  [ -n "$mp3" ] && install -Dm644 "$mp3" "$pkgdir/usr/share/flow/$mp3"
+
+  # Thin launcher on PATH.
+  install -dm755 "$pkgdir/usr/bin"
+  printf '#!/bin/sh\nexec /usr/share/flow/flow "$@"\n' > "$pkgdir/usr/bin/flow"
+  chmod 755 "$pkgdir/usr/bin/flow"
+
+  # Desktop entry + icon + license.
+  install -Dm644 linux/flow.desktop "$pkgdir/usr/share/applications/flow.desktop"
+  install -Dm644 linux/flow.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/flow.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
