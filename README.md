@@ -57,6 +57,20 @@ JSON files under `~/.config/flow/`.
 > flow runs on **Linux and macOS**. It needs nothing beyond Python 3.8+ —
 > optional system tools (below) unlock audio, the visualizer and native dialogs.
 
+### pipx — recommended
+
+[`pipx`](https://pipx.pypa.io) installs flow into its own isolated environment and
+puts the `flow` command on your `PATH`. It's the cleanest way to install a CLI app
+and it works everywhere — including Arch / Omarchy, where a plain `pip install`
+is blocked (see the note below).
+
+```sh
+pipx install flow-focus
+flow
+```
+
+<sub>Don't have pipx? Install it once: `sudo pacman -S python-pipx` (Arch/Omarchy) · `brew install pipx` (macOS) · `python3 -m pip install --user pipx` (others).</sub>
+
 ### pip
 
 ```sh
@@ -64,7 +78,17 @@ pip install flow-focus
 flow
 ```
 
-<sub>Want the absolute latest, straight from `main`? `pip install git+https://github.com/thepathless/flow.git`</sub>
+> [!NOTE]
+> On Arch, Omarchy, Debian, Ubuntu and other distros with an
+> **externally-managed** Python, a bare `pip install` is refused on purpose
+> ([PEP 668](https://peps.python.org/pep-0668/)). Use **pipx** (above), or
+> install into a virtual environment:
+> ```sh
+> python3 -m venv .venv && source .venv/bin/activate
+> pip install flow-focus
+> ```
+
+<sub>Want the absolute latest, straight from `main`? `pipx install git+https://github.com/thepathless/flow.git`</sub>
 
 ### From source
 
