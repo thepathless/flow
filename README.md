@@ -163,3 +163,9 @@ same on every push. Issues and pull requests are welcome.
 ## License
 
 [MIT](LICENSE). Bundled ambient recordings are CC0 / public-domain.
+
+---
+
+<div align="center">
+<sub>For my <b>Mimi</b> — my favorite reason to look up from the screen. 💗</sub>
+</div>
